@@ -25,7 +25,11 @@ class SMPModel(BaseModel):
             *args,
             **kwargs
         )
-        self.save_hyperparameters()
+        # Only save encoder_name here. Calling save_hyperparameters() with no args
+        # re-captures pos_class_weight from this frame's locals (the raw ~964 value),
+        # clobbering the (0,1)-normalised value BaseModel just computed for Focal
+        # loss -> sigmoid_focal_loss then gets alpha = 1 - 964 and raises.
+        self.save_hyperparameters("encoder_name")
         encoder_weights = encoder_weights if encoder_weights != "none" else None
         self.model = smp.Unet(
             encoder_name=encoder_name,  # choose encoder, e.g. mobilenet_v2 or efficientnet-b7

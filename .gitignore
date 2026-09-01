@@ -1,0 +1,5 @@
+# Storage
+*.pyc
+logs/
+lightning_logs/
+artifacts/

@@ -5,7 +5,6 @@ import rasterio
 from torch.utils.data import Dataset
 import torch
 import numpy as np
-from torch.utils.data.dataset import T_co
 import glob
 import warnings
 from .utils import get_means_stds_missing_values, get_indices_of_degree_features
@@ -105,14 +104,20 @@ class FireSpreadDataset(Dataset):
         first_id_in_current_fire = 0
         found_fire_year = None
         found_fire_name = None
-        for fire_year in self.datapoints_per_fire:    
-            for fire_name, datapoints_in_fire in self.datapoints_per_fire[fire_year].items():
-                if target_id - first_id_in_current_fire < datapoints_in_fire:
-                    found_fire_year = fire_year
-                    found_fire_name = fire_name
-                    break
-                else:
-                    first_id_in_current_fire += datapoints_in_fire
+        for fire_year in self.datapoints_per_fire:
+            # `break` only exits the inner loop, so without this guard the outer
+            # loop keeps going and re-matches the first fire of every later year
+            # (target_id - first_id_in_current_fire goes negative, which is < any
+            # count) -> every index resolves to a fire in the LAST year. Guard so
+            # we stop updating once the fire is found. Matches upstream WSTS.
+            if found_fire_year is None:
+                for fire_name, datapoints_in_fire in self.datapoints_per_fire[fire_year].items():
+                    if target_id - first_id_in_current_fire < datapoints_in_fire:
+                        found_fire_year = fire_year
+                        found_fire_name = fire_name
+                        break
+                    else:
+                        first_id_in_current_fire += datapoints_in_fire
 
         in_fire_index = target_id - first_id_in_current_fire
 
@@ -445,9 +450,17 @@ class FireSpreadDataset(Dataset):
             _type_: _description_
         """
         T, C, H, W = x.shape
-        H_new, W_new = self.crop_side_length, self.crop_side_length
-        #H_new = H//32 * 32
-        #W_new = W//32 * 32
+        # Test eval crop = crop_side_length (128) centre crop. This is a committed
+        # decision in the WSTS+ lineage (it replaced the original WSTS `H//32*32`
+        # near-full-res crop); empirically it reproduces the paper's Table 2
+        # (mean 0.447 +/- 0.095 vs 0.455 +/- 0.090) better than H//32*32
+        # (0.438 +/- 0.113). Set WSTS_TEST_CROP=fullres for the original behaviour.
+        import os as _os
+        if _os.environ.get("WSTS_TEST_CROP") == "fullres":
+            H_new = H // 32 * 32
+            W_new = W // 32 * 32
+        else:
+            H_new = W_new = self.crop_side_length
 
         x = TF.center_crop(x, (H_new, W_new))
         y = TF.center_crop(y, (H_new, W_new))

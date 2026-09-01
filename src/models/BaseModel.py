@@ -68,7 +68,14 @@ class BaseModel(pl.LightningModule, ABC):
         self.test_f1 = self.train_f1.clone()
         
 
-        self.test_avg_precision = torchmetrics.AveragePrecision("binary")
+        # Exact AP (thresholds=None). A fixed N-bin grid (thresholds=1000) was used
+        # transiently to survive full-res test OOM, but it under-estimates AP by a
+        # consistent ~0.003 (step-approx undershoot); with the 128-crop eval the
+        # exact metric fits in memory. WSTS_AP_THRESHOLDS=1000 restores the binned one.
+        import os as _os
+        _apt = _os.environ.get("WSTS_AP_THRESHOLDS", "none")
+        _apt = None if _apt.lower() in ("none", "exact", "0") else int(_apt)
+        self.test_avg_precision = torchmetrics.AveragePrecision("binary", thresholds=_apt)
 
         self.val_avg_precision = self.test_avg_precision.clone()
         self.test_precision = torchmetrics.Precision("binary")

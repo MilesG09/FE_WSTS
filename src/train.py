@@ -18,8 +18,11 @@ class MyLightningCLI(LightningCLI):
     def add_arguments_to_parser(self, parser):
         parser.link_arguments("trainer.default_root_dir",
                               "trainer.logger.init_args.save_dir")
-        parser.link_arguments("model.class_path",
-                              "trainer.logger.init_args.name")
+        # NOTE(reproduction): the upstream link below forces every run's wandb
+        # display name to "models.SMPModel", which collides across a 12-fold sweep.
+        # Disabled so each fold can pass its own --trainer.logger.init_args.name.
+        # parser.link_arguments("model.class_path",
+        #                       "trainer.logger.init_args.name")
         parser.add_argument("--do_train", type=bool,
                             help="If True: skip training the model.")
         parser.add_argument("--do_predict", type=bool,
