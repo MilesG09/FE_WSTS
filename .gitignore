@@ -3,3 +3,6 @@
 logs/
 lightning_logs/
 artifacts/
+# personal research journal (not tracked)
+administrative/
+scripts/

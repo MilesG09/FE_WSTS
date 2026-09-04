@@ -107,6 +107,16 @@ def main():
         cli.trainer.validate(cli.model, cli.datamodule, ckpt_path=ckpt)
 
     if cli.config.do_test:
+        # torchmetrics' binned PrecisionRecallCurve / ConfusionMatrix / JaccardIndex
+        # fall back to an `arange(n_bins).repeat(n_pixels, 1)` path whenever torch's
+        # deterministic-algorithms flag is set (that includes `--trainer.deterministic
+        # warn`, the config default). That fallback allocates one large tensor per
+        # batch and OOMs a 12 GB card in the first test batches. Test runs over frozen
+        # weights, so disabling determinism here changes no metric value -- it only
+        # lets `--do_train=true --do_test=true` complete in a single process instead
+        # of forcing a separate deterministic=false test sweep. Training above is
+        # unaffected; it already ran under whatever --trainer.deterministic was given.
+        torch.use_deterministic_algorithms(False)
         cli.trainer.test(cli.model, cli.datamodule, ckpt_path=ckpt)
 
     if cli.config.do_predict:
