@@ -1,3 +1,5 @@
+import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import List, Optional
 
@@ -17,7 +19,8 @@ class FireSpreadDataset(Dataset):
     def __init__(self, data_dir: str, included_fire_years: List[int], n_leading_observations: int,
                  crop_side_length: int, load_from_hdf5: bool, is_train: bool, remove_duplicate_features: bool,
                  stats_years: List[int], n_leading_observations_test_adjustment: Optional[int] = None, 
-                 features_to_keep: Optional[List[int]] = None, return_doy: bool = False, is_pad: Optional[bool] = False):
+                 features_to_keep: Optional[List[int]] = None, return_doy: bool = False, is_pad: Optional[bool] = False,
+                 hdf5_cache_size: int = 64):
         """_summary_
 
         Args:
@@ -34,6 +37,8 @@ class FireSpreadDataset(Dataset):
             features_to_keep (Optional[List[int]], optional): _description_. List of feature indices from 0 to 39, indicating which features to keep. Defaults to None, which means using all features.
             return_doy (bool, optional): _description_. Return the day of the year per time step, as an additional feature. Defaults to False.
             is_pad (book, optional): _description_. Whether to zero-pad image to 224x224 for SwinUnet/TransUnet
+            hdf5_cache_size (int, optional): _description_. Maximum number of open h5py.File handles this dataset
+        keeps cached per worker process. Defaults to 64.
         Raises:
             ValueError: _description_ Raised if input values are not in the expected ranges.
         """
@@ -51,6 +56,75 @@ class FireSpreadDataset(Dataset):
         self.included_fire_years = included_fire_years
         self.data_dir = data_dir
         self.is_pad = is_pad
+
+        # ------------------------------------------------------------------ #
+        # Training-efficiency machinery. Every optimisation below keeps its    #
+        # original code path behind a WSTS_DISABLE_* environment flag, so      #
+        # scripts/verify_pipeline_equivalence.py can build the same dataset    #
+        # twice and prove the outputs are bit-identical. Nothing here may      #
+        # change a single value the model sees -- these runs are compared      #
+        # against the WSTS+ paper, and a silent 1e-7 drift invalidates that.   #
+        # ------------------------------------------------------------------ #
+
+        # Cap on distinct open h5py.File handles this worker keeps cached. Uncapped caching
+        # grows each persistent worker's private memory roughly 3x over a few minutes of
+        # training, tracking open-file-descriptor count, and eventually trips the OOM killer.
+        # An LRU bounds that while keeping repeated reads from the same fire cheap.
+        self._hdf5_cache_max = hdf5_cache_size
+        self._hdf5_file_cache = OrderedDict()
+        # Which process the cached handles belong to; see _get_hdf5_file for why.
+        self._hdf5_cache_pid = os.getpid()
+
+        # Partial-read (hyperslab) optimisation. load_imgs used to pull every channel at full
+        # resolution and let Python throw most of it away -- the 128x128 crop in
+        # preprocess_and_augment, then features_to_keep. Measured read amplification was ~18x:
+        # ~7.9 MB off disk per sample to feed ~0.44 MB to the model.
+        #
+        # Only the raw channels feeding features_to_keep can affect the output. That is
+        # verified empirically rather than inferred: scripts/verify_channel_dependency.py
+        # zeroes each raw channel in turn and confirms the pipeline output is unchanged for
+        # the channels we skip. Channels outside the set are zero-filled after the read, so
+        # every downstream fixed index -- land cover at 16, indices_of_degree_features, the
+        # x[:, -1] active-fire channel -- keeps working with no other code change.
+        #
+        # Escape hatch: WSTS_DISABLE_HDF5_READ_OPT=1 restores the full-read path.
+        self._raw_channels_needed = None
+        if self.load_from_hdf5 and not os.environ.get("WSTS_DISABLE_HDF5_READ_OPT"):
+            self._raw_channels_needed = self.raw_channels_for_features(
+                self.features_to_keep)
+
+        # Crop-search optimisation (see augment). The random-crop loop scored ten candidates by
+        # materialising the full (T, C, H, W) crop each time, but only ever read one channel of
+        # it. Setting WSTS_DISABLE_CROP_OPT=1 restores the original path for A/B verification.
+        self._crop_search_materialises = bool(
+            os.environ.get("WSTS_DISABLE_CROP_OPT"))
+
+        # Land-cover one-hot skip. preprocess_and_augment expands channel 16 into 17 one-hot
+        # channels (24 -> 40), but nothing downstream reads them unless features_to_keep asks
+        # for an index in [16, 32]. When it does not, the expansion is built and discarded on
+        # every single sample.
+        #
+        # Skipping it leaves the tensor 24-wide, so every index that refers to the 40-channel
+        # space has to be remapped. features_to_keep on the CONFIG stays in 40-space on purpose
+        # -- train.py feeds it to get_n_features() and the feature COUNT must not change -- so
+        # the remap lives here, on the instance, and never leaks outward.
+        #
+        # Escape hatch: WSTS_DISABLE_ONEHOT_SKIP=1.
+        self._skip_one_hot = False
+        self._features_to_keep_effective = self.features_to_keep
+        _, dynamic_ids = self.get_static_and_dynamic_features_to_keep(
+            self.features_to_keep)
+        self._dynamic_ids_effective = dynamic_ids
+
+        if not os.environ.get("WSTS_DISABLE_ONEHOT_SKIP"):
+            remapped_keep = self.remap_indices_without_one_hot(self.features_to_keep)
+            remapped_dynamic = self.remap_indices_without_one_hot(dynamic_ids)
+            # Only safe when NOTHING requested lives inside the one-hot block; otherwise the
+            # expansion is load-bearing and we silently keep the original path.
+            if remapped_keep is not None and remapped_dynamic is not None:
+                self._skip_one_hot = True
+                self._features_to_keep_effective = remapped_keep
+                self._dynamic_ids_effective = remapped_dynamic
 
         self.validate_inputs()
 
@@ -123,6 +197,165 @@ class FireSpreadDataset(Dataset):
 
         return found_fire_year, found_fire_name, in_fire_index
 
+    # Number of channels physically present in the HDF5 files, before any preprocessing.
+    # preprocess_and_augment turns these 23 into 40: it appends a binary active-fire mask
+    # (23 -> 24), then expands the land-cover integer at 16 into 17 one-hot channels,
+    # giving 16 + 17 + 7 = 40.
+    N_RAW_HDF5_CHANNELS = 23
+
+    # Density above which the partial read is NOT worth doing, as a fraction of
+    # N_RAW_HDF5_CHANNELS. The partial read trades I/O for CPU: h5py builds a channel
+    # selection and the result is scattered into a full-width zero array. These HDF5
+    # files are contiguous and unchunked, so a scattered selection covering most of the
+    # channel range drags the same extent past the block layer anyway -- the saving
+    # vanishes while the scatter cost stays.
+    #
+    # Measured, not guessed (scripts/benchmark_hyperslab_density.py, 2026-09-04, evenly
+    # spread channels, cold cache, 3 files x 3 trials). Read time vs the plain full read:
+    #
+    #   fraction of channels :  0.09  0.17  0.26  0.35  0.43  0.52  0.70
+    #   T=1 (2 frames read)  : 3.28x 1.46x 1.15x 0.94x 0.76x 0.74x 0.65x
+    #   T=5 (6 frames read)  : 4.16x 2.65x 1.68x 1.29x 1.05x 0.90x 0.75x
+    #
+    # The crossover MOVES with the number of frames read -- more frames means more bytes
+    # per read and more to save -- so the guard is set by the tighter case (T=1, which
+    # turns negative just past 0.26) rather than by an average that would silently
+    # regress the monotemporal configs. End-to-end this matches: the vegetation config
+    # (6 of 23 = 0.26) measured 1.20x faster __getitem__ at T=1 and 1.35x at T=5, while
+    # the multi-feature config (16 of 23 = 0.70) measured 0.82x -- a 22% REGRESSION, with
+    # zero bytes saved, which is what this guard exists to prevent.
+    #
+    # Override at construction time with WSTS_HDF5_READ_OPT_MAX_FRACTION, which is read
+    # per call rather than at import, so it behaves like the WSTS_DISABLE_* flags.
+    HDF5_READ_OPT_MAX_FRACTION = 0.3
+
+    @staticmethod
+    def raw_channels_for_features(features_to_keep: Optional[List[int]]) -> Optional[List[int]]:
+        """Map post-preprocessing feature indices (0..39) back to raw HDF5 channels.
+
+        The mapping follows directly from how preprocess_and_augment builds its 40
+        channels (see N_RAW_HDF5_CHANNELS):
+
+            post 0..15  <- raw 0..15   passed through unchanged
+            post 16..32 <- raw 16      land cover, one-hot expanded into 17 channels
+            post 33..38 <- raw 17..22  shifted right by the one-hot expansion
+            post 39     <- raw 22      binary active-fire mask, derived from x[:, -1]
+
+        Returns a sorted list of raw channel indices, or None meaning "read everything"
+        (no feature subset requested, or an unrecognised layout -- fail safe, not fast).
+        """
+        if not features_to_keep:
+            return None
+
+        n_raw = FireSpreadDataset.N_RAW_HDF5_CHANNELS
+        needed = set()
+        for post_idx in features_to_keep:
+            if post_idx < 16:
+                needed.add(post_idx)
+            elif post_idx <= 32:
+                needed.add(16)
+            elif post_idx <= 38:
+                needed.add(post_idx - 16)
+            else:
+                needed.add(n_raw - 1)
+
+        # The label y is always the last channel of the last timestep, regardless of
+        # which features are kept, so it must always be read.
+        needed.add(n_raw - 1)
+
+        if any(c < 0 or c >= n_raw for c in needed):
+            return None
+
+        # Too dense to be worth it -- fall back to the plain full read. Returning None
+        # (rather than a channel list nobody benefits from) keeps the decision in one
+        # place: everywhere downstream, `_raw_channels_needed is None` already means
+        # "read everything".
+        max_fraction = float(os.environ.get(
+            "WSTS_HDF5_READ_OPT_MAX_FRACTION",
+            FireSpreadDataset.HDF5_READ_OPT_MAX_FRACTION))
+        if len(needed) > max_fraction * n_raw:
+            return None
+
+        return sorted(needed)
+
+    @staticmethod
+    def remap_indices_without_one_hot(
+            indices: Optional[List[int]]) -> Optional[List[int]]:
+        """Translate 40-channel-space indices into the 24-channel pre-one-hot space.
+
+        preprocess_and_augment builds its 40 channels as
+        `[x[:, :16], one_hot(landcover, 17), x[:, 17:]]` over a 24-channel tensor
+        (23 raw + appended active-fire mask). Undoing that expansion:
+
+            post 0..15  -> 0..15    (before the insertion point, unshifted)
+            post 16..32 -> the one-hot block itself; no pre-expansion equivalent
+            post 33..39 -> 17..23   (shifted back by the 16 channels the block added)
+
+        Returns None if ANY index falls inside the one-hot block, meaning the expansion is
+        actually needed and must not be skipped. Returning None rather than raising keeps
+        this a fast-path check: callers fall back to the original behaviour.
+        """
+        if indices is None:
+            return None
+        out = []
+        for idx in indices:
+            if idx < 16:
+                out.append(idx)
+            elif idx <= 32:
+                return None
+            else:
+                out.append(idx - 16)
+        return out
+
+    def close_hdf5_cache(self):
+        """Close and forget every cached handle. Call before forking DataLoader workers.
+
+        FireSpreadDataModule.setup() can iterate the whole dataset in the PARENT process
+        (the ignition filters), which populates this cache there. Forking after that
+        would hand every worker a duplicate of the parent's file descriptors, and HDF5
+        is explicitly not fork-safe across shared handles -- concurrent reads through
+        inherited descriptors can return corrupt data with no error.
+        """
+        while self._hdf5_file_cache:
+            _, f = self._hdf5_file_cache.popitem()
+            try:
+                f.close()
+            except Exception:  # noqa: BLE001 - a handle we are discarding anyway
+                pass
+
+    def _get_hdf5_file(self, path):
+        """Return a cached h5py.File handle for `path`, opening it on first use.
+
+        Each DataLoader worker is normally a forked copy of this dataset with an EMPTY
+        cache, so each worker populates its own handles and none is ever shared. With
+        persistent_workers=True a worker lives for the entire run, so an unbounded cache
+        would keep every touched HDF5 file open forever; this is an LRU capped at
+        self._hdf5_cache_max instead.
+
+        The pid check is the safety net for the case where that assumption breaks: if
+        anything reads samples in the parent before workers fork (the ignition filters in
+        FireSpreadDataModule.setup() do exactly that), the child inherits live HDF5
+        descriptors. Those are NOT safe to use -- so a child that finds handles from
+        another pid discards the dict and reopens its own. They are dropped without
+        close(), deliberately: closing an inherited descriptor reaches into HDF5 state
+        the parent still owns, which is the failure this check exists to avoid.
+        """
+        if self._hdf5_cache_pid != os.getpid():
+            self._hdf5_file_cache = OrderedDict()
+            self._hdf5_cache_pid = os.getpid()
+
+        if path in self._hdf5_file_cache:
+            self._hdf5_file_cache.move_to_end(path)
+            return self._hdf5_file_cache[path]
+
+        if len(self._hdf5_file_cache) >= self._hdf5_cache_max:
+            _, oldest_file = self._hdf5_file_cache.popitem(last=False)
+            oldest_file.close()
+
+        f = h5py.File(path, 'r')
+        self._hdf5_file_cache[path] = f
+        return f
+
     def load_imgs(self, found_fire_year, found_fire_name, in_fire_index):
         """_summary_ Load the images corresponding to the specified data point from disk.
 
@@ -143,13 +376,26 @@ class FireSpreadDataset(Dataset):
 
         if self.load_from_hdf5:
             hdf5_path = self.imgs_per_fire[found_fire_year][found_fire_name][0]
-            with h5py.File(hdf5_path, 'r') as f:
-                imgs = f["data"][in_fire_index:end_index]
-                if self.return_doy:
-                    doys = f["data"].attrs["img_dates"][in_fire_index:(
-                        end_index-1)]
-                    doys = self.img_dates_to_doys(doys)
-                    doys = torch.Tensor(doys)
+            f = self._get_hdf5_file(hdf5_path)
+            dset = f["data"]
+            if self._raw_channels_needed is None:
+                imgs = dset[in_fire_index:end_index]
+            else:
+                # Hyperslab read: pull only the load-bearing channels off disk, then
+                # scatter them back into a full-width zero array. The zero-fill is what
+                # lets every downstream fixed channel index stay valid without touching
+                # preprocess_and_augment. Slicing first (rather than allocating from
+                # end_index) keeps the natural clamping when end_index runs past the end
+                # of the fire's time series.
+                sub = dset[in_fire_index:end_index, self._raw_channels_needed]
+                imgs = np.zeros(
+                    (sub.shape[0], dset.shape[1]) + sub.shape[2:], dtype=sub.dtype)
+                imgs[:, self._raw_channels_needed] = sub
+            if self.return_doy:
+                doys = dset.attrs["img_dates"][in_fire_index:(
+                    end_index-1)]
+                doys = self.img_dates_to_doys(doys)
+                doys = torch.Tensor(doys)
             x, y = np.split(imgs, [-1], axis=0)
             # Last image's active fire mask is used as label, rest is input data
             y = y[0, -1, ...]
@@ -189,7 +435,9 @@ class FireSpreadDataset(Dataset):
         elif self.features_to_keep is not None:
             if len(x.shape) != 4:
                 raise NotImplementedError(f"Removing features is only implemented for 4D tensors, but got {x.shape=}.")
-            x = x[:, self.features_to_keep, ...]
+            # Effective ids, not the raw config ones: identical to the config unless the
+            # land-cover one-hot was skipped, in which case they are remapped to 24-space.
+            x = x[:, self._features_to_keep_effective, ...]
 
         if self.return_doy:
             return x, y, doys
@@ -358,15 +606,19 @@ class FireSpreadDataset(Dataset):
         # Replace NaN values with 0, thereby essentially setting them to the mean of the respective feature.
         x = torch.nan_to_num(x, nan=0.0)
 
-        # Create land cover class one-hot encoding, put it where the land cover integer was
-        new_shape = (x.shape[0], x.shape[2], x.shape[3],
-                     self.one_hot_matrix.shape[0])
-        # -1 because land cover classes start at 1
-        landcover_classes_flattened = x[:, 16, ...].long().flatten() - 1
-        landcover_encoding = self.one_hot_matrix[landcover_classes_flattened].reshape(
-            new_shape).permute(0, 3, 1, 2)
-        x = torch.concatenate(
-            [x[:, :16, ...], landcover_encoding, x[:, 17:, ...]], dim=1)
+        # Create land cover class one-hot encoding, put it where the land cover integer was.
+        # Skipped entirely when no kept feature lives in the resulting [16, 32] block -- the
+        # channels would be built and then immediately dropped. Downstream indices are
+        # remapped in __init__ (see remap_indices_without_one_hot), so x stays 24-wide here.
+        if not self._skip_one_hot:
+            new_shape = (x.shape[0], x.shape[2], x.shape[3],
+                         self.one_hot_matrix.shape[0])
+            # -1 because land cover classes start at 1
+            landcover_classes_flattened = x[:, 16, ...].long().flatten() - 1
+            landcover_encoding = self.one_hot_matrix[landcover_classes_flattened].reshape(
+                new_shape).permute(0, 3, 1, 2)
+            x = torch.concatenate(
+                [x[:, :16, ...], landcover_encoding, x[:, 17:, ...]], dim=1)
 
         return x, y
 
@@ -388,26 +640,62 @@ class FireSpreadDataset(Dataset):
         # Need square crop to prevent rotation from creating/destroying data at the borders, due to uneven side lengths.
         # Try several crops, prefer the ones with most fire pixels in output, followed by most fire_pixels in input
         best_n_fire_pixels = -1
-        best_crop = (None, None)
+        L = self.crop_side_length
 
-        for i in range(10):
-            top = np.random.randint(0, x.shape[-2] - self.crop_side_length)
-            left = np.random.randint(0, x.shape[-1] - self.crop_side_length)
-            x_crop = TF.crop(
-                x, top, left, self.crop_side_length, self.crop_side_length)
-            y_crop = TF.crop(
-                y, top, left, self.crop_side_length, self.crop_side_length)
+        if self._crop_search_materialises:
+            # Original path, kept for A/B verification (WSTS_DISABLE_CROP_OPT=1).
+            best_crop = (None, None)
 
-            # We really care about having fire pixels in the target. But if we don't find any there,
-            # we care about fire pixels in the input, to learn to predict that no new observations will be made,
-            # even though previous days had active fires.
-            n_fire_pixels = x_crop[:, -1, ...].mean() + \
-                1000 * y_crop.float().mean()
-            if n_fire_pixels > best_n_fire_pixels:
-                best_n_fire_pixels = n_fire_pixels
-                best_crop = (x_crop, y_crop)
+            for i in range(10):
+                top = np.random.randint(0, x.shape[-2] - L)
+                left = np.random.randint(0, x.shape[-1] - L)
+                x_crop = TF.crop(x, top, left, L, L)
+                y_crop = TF.crop(y, top, left, L, L)
 
-        x, y = best_crop
+                # We really care about having fire pixels in the target. But if we don't find any there,
+                # we care about fire pixels in the input, to learn to predict that no new observations will be made,
+                # even though previous days had active fires.
+                n_fire_pixels = x_crop[:, -1, ...].mean() + \
+                    1000 * y_crop.float().mean()
+                if n_fire_pixels > best_n_fire_pixels:
+                    best_n_fire_pixels = n_fire_pixels
+                    best_crop = (x_crop, y_crop)
+
+            x, y = best_crop
+        else:
+            # Same search, without building the nine crops it throws away.
+            #
+            # The score reads ONLY x's active-fire channel and y, but the original cropped
+            # the full (T, C, H, W) tensor ten times to get them. That waste scales with
+            # n_leading_observations, which is why augment costs proportionally more on the
+            # multitemporal configs.
+            #
+            # Bit-identical, by construction:
+            #  - identical np.random.randint calls, same count and order, so the RNG stream
+            #    and therefore the candidate crops are unchanged;
+            #  - TF.crop is `img[..., top:top+h, left:left+w]`, so slicing here yields a view
+            #    with the same shape, strides and storage offset that the original scored --
+            #    literally the same tensor, hence the same mean, hence the same argmax;
+            #  - `>` is preserved, so ties still keep the FIRST candidate, not the last.
+            best_top = best_left = None
+
+            for i in range(10):
+                top = np.random.randint(0, x.shape[-2] - L)
+                left = np.random.randint(0, x.shape[-1] - L)
+
+                x_af = x[:, -1, top:top + L, left:left + L]
+                y_crop = y[..., top:top + L, left:left + L]
+
+                n_fire_pixels = x_af.mean() + 1000 * y_crop.float().mean()
+                if n_fire_pixels > best_n_fire_pixels:
+                    best_n_fire_pixels = n_fire_pixels
+                    best_top, best_left = top, left
+
+            # Materialise the winner through the same TF.crop call as before. The later angle
+            # corrections write in place (`x[:, degree_features] = 360 - ...`), so keeping the
+            # identical view/copy semantics here matters -- this is not the place to be clever.
+            x = TF.crop(x, best_top, best_left, L, L)
+            y = TF.crop(y, best_top, best_left, L, L)
 
         hflip = bool(np.random.random() > 0.5)
         vflip = bool(np.random.random() > 0.5)
@@ -455,8 +743,7 @@ class FireSpreadDataset(Dataset):
         # near-full-res crop); empirically it reproduces the paper's Table 2
         # (mean 0.447 +/- 0.095 vs 0.455 +/- 0.090) better than H//32*32
         # (0.438 +/- 0.113). Set WSTS_TEST_CROP=fullres for the original behaviour.
-        import os as _os
-        if _os.environ.get("WSTS_TEST_CROP") == "fullres":
+        if os.environ.get("WSTS_TEST_CROP") == "fullres":
             H_new = H // 32 * 32
             W_new = W // 32 * 32
         else:
@@ -494,11 +781,12 @@ class FireSpreadDataset(Dataset):
         Returns:
             _type_: _description_
         """
-        static_feature_ids, dynamic_feature_ids = self.get_static_and_dynamic_features_to_keep(self.features_to_keep)
-        dynamic_feature_ids = torch.tensor(dynamic_feature_ids).int()
+        # Effective ids, not the raw config ones: they are already remapped to the 24-channel
+        # space when the land-cover one-hot is skipped, and identical to the config otherwise.
+        dynamic_feature_ids = torch.tensor(self._dynamic_ids_effective).int()
 
         x_dynamic_only = x[:-1, dynamic_feature_ids, :, :].flatten(start_dim=0, end_dim=1)
-        x_last_day = x[-1, self.features_to_keep, ...].squeeze(0)
+        x_last_day = x[-1, self._features_to_keep_effective, ...].squeeze(0)
 
         return torch.cat([x_dynamic_only, x_last_day], axis=0)
 

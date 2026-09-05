@@ -16,6 +16,9 @@ class FireSpreadDataModule(LightningDataModule):
                  load_from_hdf5: bool, num_workers: int, remove_duplicate_features: bool, 
                  is_pad: Optional[bool] = False,
                  features_to_keep: Union[Optional[List[int]], str] = None, return_doy: bool = False,
+                 prefetch_factor: int = 2,
+                 persistent_workers: bool = True,
+                 hdf5_cache_size: int = 64,
                  data_fold_id: int = 0, non_outlier_indices_path: Optional[str] = None, filter_ignition_train: Optional[bool] = False, filter_ignition_val_test: Optional[bool] = False,
                  ignition_only_train: Optional[bool] = False, ignition_only_val_test: Optional[bool] = False, additional_data: Optional[bool] = False, *args, **kwargs):
         """_summary_ Data module for loading the WildfireSpreadTS dataset.
@@ -35,6 +38,18 @@ class FireSpreadDataModule(LightningDataModule):
             remove_duplicate_features (bool): _description_ Remove duplicate static features from all time steps but the last one. Requires flattening the temporal dimension, since after removal, the number of features is not the same across time steps anymore.
             features_to_keep (Union[Optional[List[int]], str], optional): _description_. List of feature indices from 0 to 39, indicating which features to keep. Defaults to None, which means using all features.
             return_doy (bool, optional): _description_. Return the day of the year per time step, as an additional feature. Defaults to False.
+            prefetch_factor (int, optional): _description_. Number of batches each dataloader worker buffers ahead.
+              Only affects how far ahead loading runs -- it changes neither the number of worker RNG streams nor
+              sample order, so it cannot change results. Defaults to 2 (the PyTorch default).
+            persistent_workers (bool, optional): _description_. Keep the training worker pool (and each
+              worker's warm h5py handle cache) alive across epochs instead of respawning it every epoch.
+              Epoch 0 is bit-identical either way (verified). Later epochs draw a DIFFERENT augmentation
+              stream, because PyTorch seeds each worker's numpy RNG from a base_seed taken when the
+              iterator is created: respawned workers get a fresh seed per epoch, persistent workers carry
+              one stream forward. Neither degenerates -- both give fresh augmentation every epoch -- but
+              the two are not the same sequence, so a run is only step-for-step reproducible against
+              another run with the same setting. Defaults to True; set False for the pre-2026-09-04
+              behaviour. See scripts/verify_dataloader_settings.py.
             data_fold_id (int, optional): _description_. Which data fold to use, i.e. splitting years into train/val/test set. Defaults to 0.
         """
         super().__init__()
@@ -54,6 +69,9 @@ class FireSpreadDataModule(LightningDataModule):
         self.batch_size = batch_size
         self.train_dataset, self.val_dataset, self.test_dataset = None, None, None
         self.is_pad=is_pad
+        self.prefetch_factor = prefetch_factor
+        self.persistent_workers = persistent_workers
+        self.hdf5_cache_size = hdf5_cache_size
         self.non_outlier_indices_path = non_outlier_indices_path
         self.filter_ignition_train = filter_ignition_train
         self.filter_ignition_val_test = filter_ignition_val_test
@@ -61,6 +79,20 @@ class FireSpreadDataModule(LightningDataModule):
         self.ignition_only_val_test = ignition_only_val_test
         self.additional_data = additional_data
 
+
+    @staticmethod
+    def _close_hdf5_handles(dataset):
+        """Release HDF5 handles opened while scanning a dataset in THIS process.
+
+        keep_ignition and filter_dataset read every sample here in the parent, which
+        fills FireSpreadDataset's handle cache. DataLoader workers are forked from the
+        parent, and HDF5 is not fork-safe across shared descriptors, so the cache has to
+        be emptied before that happens. FireSpreadDataset._get_hdf5_file also detects a
+        pid change on its own -- this is the tidy path, that is the safety net.
+        """
+        inner = getattr(dataset, "dataset", dataset)  # unwrap Subset
+        if hasattr(inner, "close_hdf5_cache"):
+            inner.close_hdf5_cache()
 
     def keep_ignition(self, dataset):
         ignition_indices = []
@@ -81,6 +113,7 @@ class FireSpreadDataModule(LightningDataModule):
         print(f"Total samples: {total_samples}")
         print(f"Kept samples (ignition): {kept} ({kept/total_samples:.2%})")
         print(f"Discarded samples: {total_samples - kept} ({(total_samples - kept)/total_samples:.2%})")
+        self._close_hdf5_handles(dataset)
         return Subset(dataset, ignition_indices)
 
     def filter_dataset(self, dataset):
@@ -104,7 +137,8 @@ class FireSpreadDataModule(LightningDataModule):
         print(f"Total samples: {total_samples}")
         print(f"Kept samples (current fire): {kept} ({kept/total_samples:.2%})")
         print(f"Discarded samples: {total_samples - kept} ({(total_samples - kept)/total_samples:.2%})")
-        
+
+        self._close_hdf5_handles(dataset)
         return Subset(dataset, valid_indices)
         
     def setup(self, stage):
@@ -117,7 +151,7 @@ class FireSpreadDataModule(LightningDataModule):
                                                load_from_hdf5=self.load_from_hdf5, is_train=True,
                                                remove_duplicate_features=self.remove_duplicate_features,
                                                features_to_keep=self.features_to_keep, return_doy=self.return_doy,
-                                               stats_years=train_years, is_pad=self.is_pad)
+                                               stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size)
         
         if self.non_outlier_indices_path is not None:
             non_outlier_indices = np.load(self.non_outlier_indices_path).tolist()
@@ -138,7 +172,7 @@ class FireSpreadDataModule(LightningDataModule):
                                              load_from_hdf5=self.load_from_hdf5, is_train=True,
                                              remove_duplicate_features=self.remove_duplicate_features,
                                              features_to_keep=self.features_to_keep, return_doy=self.return_doy,
-                                             stats_years=train_years, is_pad=self.is_pad)
+                                             stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size)
         self.test_dataset = FireSpreadDataset(data_dir=self.data_dir, included_fire_years=test_years,
                                               n_leading_observations=self.n_leading_observations,
                                               n_leading_observations_test_adjustment=self.n_leading_observations_test_adjustment,
@@ -146,7 +180,7 @@ class FireSpreadDataModule(LightningDataModule):
                                               load_from_hdf5=self.load_from_hdf5, is_train=False,
                                               remove_duplicate_features=self.remove_duplicate_features,
                                               features_to_keep=self.features_to_keep, return_doy=self.return_doy,
-                                              stats_years=train_years, is_pad=self.is_pad)
+                                              stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size)
 
         if self.filter_ignition_val_test:
             self.val_dataset = self.filter_dataset(self.val_dataset)
@@ -156,17 +190,39 @@ class FireSpreadDataModule(LightningDataModule):
             self.val_dataset = self.keep_ignition(self.val_dataset)
             self.test_dataset = self.keep_ignition(self.test_dataset)
 
-    def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers, pin_memory=True)
+    # persistent_workers keeps the worker pool (and each worker's warm h5py handle cache)
+    # alive across epochs instead of respawning it every epoch. It is guarded on
+    # num_workers > 0 rather than a bare True, because DataLoader raises on
+    # persistent_workers=True with num_workers=0.
+    def _loader_kwargs(self, persistent: bool):
+        kwargs = dict(num_workers=self.num_workers, pin_memory=True,
+                      persistent_workers=(persistent and self.persistent_workers
+                                          and self.num_workers > 0))
+        if self.num_workers > 0:
+            kwargs["prefetch_factor"] = self.prefetch_factor
+        return kwargs
 
+    def train_dataloader(self):
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True,
+                          **self._loader_kwargs(persistent=True))
+
+    # Only the TRAIN loader is persistent. persistent_workers pays off when the same
+    # DataLoader is iterated many times -- the training loader, once per epoch for hundreds
+    # of epochs. The others are each iterated once per phase, so persistence buys them
+    # nothing and costs a second live worker pool: at num_workers=8 that is 8 extra
+    # processes holding memory alongside the training pool, which is what put aggregate
+    # worker memory over the edge at higher worker counts (OOM-killed workers, 2026-08-16).
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False,
+                          **self._loader_kwargs(persistent=False))
 
     def test_dataloader(self):
-        return DataLoader(self.test_dataset, batch_size=1, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.test_dataset, batch_size=1, shuffle=False,
+                          **self._loader_kwargs(persistent=False))
 
     def predict_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers, pin_memory=True)
+        return DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False,
+                          **self._loader_kwargs(persistent=False))
 
     @staticmethod
     def split_fires(data_fold_id, additional_data):
