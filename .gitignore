@@ -3,6 +3,8 @@
 logs/
 lightning_logs/
 artifacts/
+hdf5_data
+quarantine_dataset_files/
 # personal research journal (not tracked)
 administrative/
 scripts/

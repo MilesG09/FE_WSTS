@@ -20,7 +20,11 @@ class FireSpreadDataModule(LightningDataModule):
                  persistent_workers: bool = True,
                  hdf5_cache_size: int = 64,
                  data_fold_id: int = 0, non_outlier_indices_path: Optional[str] = None, filter_ignition_train: Optional[bool] = False, filter_ignition_val_test: Optional[bool] = False,
-                 ignition_only_train: Optional[bool] = False, ignition_only_val_test: Optional[bool] = False, additional_data: Optional[bool] = False, *args, **kwargs):
+                 ignition_only_train: Optional[bool] = False, ignition_only_val_test: Optional[bool] = False, additional_data: Optional[bool] = False, 
+                 use_centroid_position: bool = False, use_centroid_velocity: bool = False,
+                 use_centroid_position_validity: bool = False,
+                 use_centroid_velocity_validity: bool = False,
+                 *args, **kwargs):
         """_summary_ Data module for loading the WildfireSpreadTS dataset.
 
         Args:
@@ -79,6 +83,26 @@ class FireSpreadDataModule(LightningDataModule):
         self.ignition_only_val_test = ignition_only_val_test
         self.additional_data = additional_data
 
+        self.use_centroid_position = use_centroid_position
+        self.use_centroid_velocity = use_centroid_velocity
+        self.use_centroid_position_validity = use_centroid_position_validity
+        self.use_centroid_velocity_validity = use_centroid_velocity_validity
+
+    @property
+    def _centroid_kwargs(self):
+        """The four centroid flags, in the form FireSpreadDataset's constructor takes.
+
+        Declared once because setup() builds three datasets and all three must agree:
+        a flag added to __init__ but forgotten at one call site fails silently -- the
+        dataset defaults it to False and the mismatch only surfaces as an in_channels
+        error at the first forward pass.
+        """
+        return dict(
+            use_centroid_position=self.use_centroid_position,
+            use_centroid_velocity=self.use_centroid_velocity,
+            use_centroid_position_validity=self.use_centroid_position_validity,
+            use_centroid_velocity_validity=self.use_centroid_velocity_validity,
+        )
 
     @staticmethod
     def _close_hdf5_handles(dataset):
@@ -151,7 +175,8 @@ class FireSpreadDataModule(LightningDataModule):
                                                load_from_hdf5=self.load_from_hdf5, is_train=True,
                                                remove_duplicate_features=self.remove_duplicate_features,
                                                features_to_keep=self.features_to_keep, return_doy=self.return_doy,
-                                               stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size)
+                                               stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size,
+                                               **self._centroid_kwargs)
         
         if self.non_outlier_indices_path is not None:
             non_outlier_indices = np.load(self.non_outlier_indices_path).tolist()
@@ -172,7 +197,8 @@ class FireSpreadDataModule(LightningDataModule):
                                              load_from_hdf5=self.load_from_hdf5, is_train=True,
                                              remove_duplicate_features=self.remove_duplicate_features,
                                              features_to_keep=self.features_to_keep, return_doy=self.return_doy,
-                                             stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size)
+                                             stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size,
+                                               **self._centroid_kwargs)
         self.test_dataset = FireSpreadDataset(data_dir=self.data_dir, included_fire_years=test_years,
                                               n_leading_observations=self.n_leading_observations,
                                               n_leading_observations_test_adjustment=self.n_leading_observations_test_adjustment,
@@ -180,7 +206,8 @@ class FireSpreadDataModule(LightningDataModule):
                                               load_from_hdf5=self.load_from_hdf5, is_train=False,
                                               remove_duplicate_features=self.remove_duplicate_features,
                                               features_to_keep=self.features_to_keep, return_doy=self.return_doy,
-                                              stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size)
+                                              stats_years=train_years, is_pad=self.is_pad, hdf5_cache_size=self.hdf5_cache_size,
+                                               **self._centroid_kwargs)
 
         if self.filter_ignition_val_test:
             self.val_dataset = self.filter_dataset(self.val_dataset)

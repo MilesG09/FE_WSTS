@@ -1,0 +1,19 @@
+# Shared data settings for every EXP-03 arm (administrative/EXPERIMENTS.md §2 "Arms" —
+# fixed-across-all-arms block). Scientific parameters live here and in cfgs/arms/<ARM>.yaml,
+# never on the command line (administrative/TODO.md "Config hygiene" — this is the fix for the
+# batch-size confound that hit EXP-01/02). Command line carries only run identity
+# (data_fold_id, run_name) and machine-local tuning (num_workers, prefetch_factor).
+data_dir: /home/miles/research/FE_WSTS/hdf5_data
+batch_size: 64
+crop_side_length: 128
+load_from_hdf5: true
+remove_duplicate_features: true
+features_to_keep: [0, 1, 2, 3, 4, 38, 39]
+n_leading_observations_test_adjustment: 5
+
+#WSTS+ cfgs
+filter_ignition_train: False
+filter_ignition_val_test: False
+ignition_only_train: False 
+ignition_only_val_test: False
+is_pad: False

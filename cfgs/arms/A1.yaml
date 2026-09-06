@@ -1,0 +1,17 @@
+# EXP-03 arm A1: n_lead=1, centroid POSITION only, no validity disclosure.
+# Pairs against A0 (identical but centroid-free) for comparison 1 in administrative/EXPERIMENTS.md:
+# "is centroid position useful AND not already learned, where the model sees the same single frame
+# the centroid is derived from?" -- the project's headline question.
+#
+# "validity: off" means gate SILENTLY (EXPERIMENTS.md, "Decided conventions", 2026-08-05): a
+# fire-free frame still falls back to the patch centre, the model just isn't told that it did.
+#
+# No velocity flags -> _n_peek_frames = 0, so load_imgs does not peek back and this arm exercises
+# exactly the pre-peek-back loading path. At n_lead=1 the per-timestep layout is identical to the
+# last-day-only layout, so this arm is unaffected by EXPERIMENTS.md P2's two open decisions.
+# Channel count: 7 base + 2 = 9.
+n_leading_observations: 1
+use_centroid_position: true
+use_centroid_velocity: false
+use_centroid_position_validity: false
+use_centroid_velocity_validity: false

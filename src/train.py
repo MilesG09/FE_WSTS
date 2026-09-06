@@ -6,6 +6,7 @@ from models import SMPModel, BaseModel, ConvLSTMLightning, LogisticRegression  #
 from models import BaseModel
 import wandb
 import os
+import subprocess
 
 from dataloader.FireSpreadDataset import FireSpreadDataset
 from dataloader.utils import get_means_stds_missing_values
@@ -41,6 +42,26 @@ class MyLightningCLI(LightningCLI):
             self.config.data.n_leading_observations,
             self.config.data.features_to_keep,
             self.config.data.remove_duplicate_features)
+        # The centroid channel count is DERIVED from the same table the dataset emits from
+        # (FireSpreadDataset.CENTROID_CHANNEL_SPEC), never hardcoded here. With four independent
+        # flags there are 16 valid layouts; a second hardcoded count would eventually disagree
+        # with the tensor the dataloader actually produces, surfacing as an in_channels error at
+        # the first forward pass -- or, worse, as a run labelled as one arm while training on
+        # another's channels. Attribute access is direct rather than getattr-with-default on
+        # purpose: a renamed flag must fail loudly instead of silently resolving to "no centroid
+        # channels" and quietly training the wrong arm.
+        centroid_names = FireSpreadDataset.centroid_channel_names(
+            self.config.data.use_centroid_position,
+            self.config.data.use_centroid_velocity,
+            self.config.data.use_centroid_position_validity,
+            self.config.data.use_centroid_velocity_validity,
+            # One channel per enabled family PER model-visible frame. n_timesteps is the model's
+            # own window; the peek-back frame the dataset loads for velocity is never emitted.
+            n_timesteps=self.config.data.n_leading_observations)
+        n_features += len(centroid_names)
+        print(f"[centroid] {len(centroid_names)} extra channel(s): "
+              f"{centroid_names if centroid_names else 'none'} "
+              f"-> model n_channels = {n_features}")
         self.config.model.init_args.n_channels = n_features
 
         # The exact positive class weight changes with the data fold in the data module, but the weight is needed to instantiate the model.
@@ -83,6 +104,70 @@ class MyLightningCLI(LightningCLI):
         wandb.define_metric("train_f1_epoch", summary="max")
         wandb.define_metric("val_f1", summary="max")
         wandb.define_metric("val_avg_precision", summary="max")
+        self.log_run_metadata()
+
+    @rank_zero_only
+    def log_run_metadata(self):
+        """Tag the run with everything needed to find and group it again later.
+
+        Written here rather than in the launch script so it holds for ANY invocation --
+        a hand-typed one-off is tagged identically to a 12-fold sweep. EXPERIMENTS.md
+        records earlier centroid runs arriving with no arm/fold/config tags at all,
+        which made them unattributable after the fact; that is what this prevents.
+
+        Every value except arm_id is DERIVED from the resolved config, so a tag cannot
+        disagree with what the run actually trained on. arm_id is the one thing not
+        recoverable from config (it names which YAML was layered on), so it comes from
+        the environment and defaults to "unspecified" rather than guessing.
+        """
+        d = self.config.data
+        centroid_names = FireSpreadDataset.centroid_channel_names(
+            d.use_centroid_position, d.use_centroid_velocity,
+            d.use_centroid_position_validity, d.use_centroid_velocity_validity,
+            n_timesteps=d.n_leading_observations)
+
+        arm_id = os.environ.get("ARM_ID", "unspecified")
+        tags = [f"arm_{arm_id}",
+                f"fold_{d.data_fold_id}",
+                f"seed_{self.config.seed_everything}",
+                f"nlead_{d.n_leading_observations}"]
+        for flag, short in (("use_centroid_position", "pos"),
+                            ("use_centroid_velocity", "vel"),
+                            ("use_centroid_position_validity", "posvalid"),
+                            ("use_centroid_velocity_validity", "velvalid")):
+            if getattr(d, flag):
+                tags.append(f"cent_{short}")
+        if not centroid_names:
+            tags.append("cent_none")
+
+        # dict.fromkeys de-duplicates while preserving order: wandb_setup is called from
+        # main() and again from before_fit/before_test, so this runs more than once.
+        wandb.run.tags = tuple(dict.fromkeys(list(wandb.run.tags) + tags))
+
+        # Which code produced this number. Without it, a sweep spanning a dataloader edit
+        # is indistinguishable from one that did not -- and the centroid work is editing
+        # the dataloader.
+        try:
+            sha = subprocess.check_output(["git", "rev-parse", "--short", "HEAD"],
+                                          stderr=subprocess.DEVNULL).decode().strip()
+            dirty = bool(subprocess.check_output(["git", "status", "--porcelain", "--", "src", "cfgs"],
+                                                 stderr=subprocess.DEVNULL).decode().strip())
+        except Exception:
+            sha, dirty = "unknown", None
+
+        wandb.config.update({
+            "arm_id": arm_id,
+            "fold": d.data_fold_id,
+            "seed": self.config.seed_everything,
+            "n_lead": d.n_leading_observations,
+            "centroid_channels": centroid_names,
+            "n_centroid_channels": len(centroid_names),
+            "n_channels": self.config.model.init_args.n_channels,
+            "git_commit": sha,
+            "git_dirty_src_or_cfgs": dirty,
+        }, allow_val_change=True)
+        print(f"[wandb] tags={list(wandb.run.tags)} git={sha}"
+              f"{' (DIRTY)' if dirty else ''}")
 
 
 def main():

@@ -1,0 +1,6 @@
+# EXP-03 arm B0: n_lead=2, centroid-free control. Internal control, no published counterpart.
+n_leading_observations: 2
+use_centroid_position: false
+use_centroid_velocity: false
+use_centroid_position_validity: false
+use_centroid_velocity_validity: false
