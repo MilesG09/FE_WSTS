@@ -16,11 +16,80 @@ from datetime import datetime
 
 
 class FireSpreadDataset(Dataset):
+
+    # Canonical order and gating of the engineered centroid channels. THIS IS THE SINGLE SOURCE
+    # OF TRUTH: _compute_centroid_channels emits channels in exactly this order, and src/train.py
+    # derives the model's in_channels from it via n_centroid_channels() -- neither side hardcodes
+    # a count. Adding a future channel means adding a row here and computing it; nothing
+    # downstream changes. Order must stay stable: it is the channel index a trained checkpoint's
+    # first conv layer was fit against.
+    CENTROID_CHANNEL_SPEC = (
+        # (channel name, name of the boolean flag that gates it)
+        # NB: "x" is the ROW coordinate (axis of length H) and "y" the COLUMN (axis of length W),
+        # inherited from the original implementation. Kept as-is to avoid churn.
+        ("centroid_x",     "use_centroid_position"),
+        ("centroid_y",     "use_centroid_position"),
+        ("centroid_vx",    "use_centroid_velocity"),
+        ("centroid_vy",    "use_centroid_velocity"),
+        ("position_valid", "use_centroid_position_validity"),
+        ("velocity_valid", "use_centroid_velocity_validity"),
+    )
+
+    @staticmethod
+    def centroid_channel_names(use_centroid_position: bool = False,
+                               use_centroid_velocity: bool = False,
+                               use_centroid_position_validity: bool = False,
+                               use_centroid_velocity_validity: bool = False,
+                               n_timesteps: int = 1) -> List[str]:
+        """Names of the centroid channels emitted under these flags, in emission order.
+
+        One channel per enabled family PER model-visible timestep, so the count is
+        `n_timesteps * (enabled families)`. Layout is **family-major** and, within a family,
+        ordered oldest -> newest -- matching both the tensor the producer stacks and the
+        oldest-first ordering the imagery channels already have after
+        flatten_and_remove_duplicate_features_.
+
+        The suffix is the **lag relative to the most recent input frame**, so `_lag0` always
+        names the last day the model sees whatever `n_timesteps` is. That keeps a suffix
+        meaning the same thing across arms with different `n_leading_observations`, which
+        matters when comparing per-channel first-layer weights between arms. (A positional
+        `_t0` suffix would instead mean "5 days ago" at C and "today" at A.)
+
+        Returns names rather than a bare count so the same call also answers "what is channel
+        i?" -- needed for debugging, for the verification script, and for logging the channel
+        layout as an MLflow tag. A count is derivable from names; names are not derivable from
+        a count.
+        """
+        enabled = {
+            "use_centroid_position": use_centroid_position,
+            "use_centroid_velocity": use_centroid_velocity,
+            "use_centroid_position_validity": use_centroid_position_validity,
+            "use_centroid_velocity_validity": use_centroid_velocity_validity,
+        }
+        names = []
+        for family, flag in FireSpreadDataset.CENTROID_CHANNEL_SPEC:
+            if enabled[flag]:
+                names.extend(f"{family}_lag{n_timesteps - 1 - t}" for t in range(n_timesteps))
+        return names
+
+    @staticmethod
+    def n_centroid_channels(use_centroid_position: bool = False,
+                            use_centroid_velocity: bool = False,
+                            use_centroid_position_validity: bool = False,
+                            use_centroid_velocity_validity: bool = False,
+                            n_timesteps: int = 1) -> int:
+        """Number of centroid channels appended to x under these flags. Called from src/train.py
+        before any dataset object exists, so it must depend only on the config values."""
+        return len(FireSpreadDataset.centroid_channel_names(
+            use_centroid_position, use_centroid_velocity,
+            use_centroid_position_validity, use_centroid_velocity_validity,
+            n_timesteps=n_timesteps))
+
     def __init__(self, data_dir: str, included_fire_years: List[int], n_leading_observations: int,
                  crop_side_length: int, load_from_hdf5: bool, is_train: bool, remove_duplicate_features: bool,
                  stats_years: List[int], n_leading_observations_test_adjustment: Optional[int] = None, 
                  features_to_keep: Optional[List[int]] = None, return_doy: bool = False, is_pad: Optional[bool] = False,
-                 hdf5_cache_size: int = 64):
+                 hdf5_cache_size: int = 64, use_centroid_position: bool = False, use_centroid_velocity: bool = False, use_centroid_position_validity: bool = False, use_centroid_velocity_validity: bool = False):
         """_summary_
 
         Args:
@@ -56,6 +125,27 @@ class FireSpreadDataset(Dataset):
         self.included_fire_years = included_fire_years
         self.data_dir = data_dir
         self.is_pad = is_pad
+
+        # Centroid Features
+        self.use_centroid_position = use_centroid_position
+        self.use_centroid_velocity = use_centroid_velocity
+        self.use_centroid_position_validity = use_centroid_position_validity
+        self.use_centroid_velocity_validity = use_centroid_velocity_validity
+        # Peek-back frames: how many days BEFORE the model's own window load_imgs must fetch so
+        # that the oldest model-visible frame still has a previous day to difference against.
+        # Velocity is defined per model-visible frame (n_timesteps channels, not n_timesteps-1),
+        # which is what makes a velocity channel possible at all at n_leading_observations=1 --
+        # and what keeps the feature's definition identical across every arm on the dose-response
+        # curve. See administrative/EXPERIMENTS.md P2 (design revision, 2026-08-25).
+        self._n_peek_frames = 1 if (use_centroid_velocity or use_centroid_velocity_validity) else 0
+
+        # Resolved once here rather than per-sample: __getitem__ runs millions of times and only
+        # needs "any centroid channel at all?" plus the fixed emission order.
+        self._centroid_channel_names = FireSpreadDataset.centroid_channel_names(
+            use_centroid_position, use_centroid_velocity,
+            use_centroid_position_validity, use_centroid_velocity_validity,
+            n_timesteps=n_leading_observations)
+        self._use_any_centroid = len(self._centroid_channel_names) > 0
 
         # ------------------------------------------------------------------ #
         # Training-efficiency machinery. Every optimisation below keeps its    #
@@ -372,6 +462,22 @@ class FireSpreadDataset(Dataset):
         """
 
         in_fire_index += self.skip_initial_samples
+
+        # Peek-back window. We read self._n_peek_frames rows FURTHER BACK than the model's own
+        # window so the oldest model-visible frame has a previous day to difference against.
+        # Frames are contiguous rows of one HDF5 dataset, so this widens the existing range read
+        # rather than adding a second one.
+        #
+        # When the window starts at the fire's first observed day the peek row does not exist. We
+        # zero-pad it instead of dropping the sample (his design, EXPERIMENTS.md P2 revision,
+        # 2026-08-25): dropping it would cost one sample per fire and make peeking arms train on
+        # a smaller set than non-peeking ones, contaminating the very contrast the feature is
+        # meant to isolate. A zeroed frame has no fire pixels, so vel_valid falls out as 0 and the
+        # velocity is gated through the ordinary code path -- "the day does not exist" and "the
+        # day had no fire" become the same case, with no extra flag to thread anywhere
+
+        n_pad = max(0, self._n_peek_frames - in_fire_index)
+        start_index = in_fire_index - self._n_peek_frames + n_pad
         end_index = (in_fire_index + self.n_leading_observations + 1)
 
         if self.load_from_hdf5:
@@ -379,7 +485,7 @@ class FireSpreadDataset(Dataset):
             f = self._get_hdf5_file(hdf5_path)
             dset = f["data"]
             if self._raw_channels_needed is None:
-                imgs = dset[in_fire_index:end_index]
+                imgs = dset[start_index:end_index]
             else:
                 # Hyperslab read: pull only the load-bearing channels off disk, then
                 # scatter them back into a full-width zero array. The zero-fill is what
@@ -387,7 +493,7 @@ class FireSpreadDataset(Dataset):
                 # preprocess_and_augment. Slicing first (rather than allocating from
                 # end_index) keeps the natural clamping when end_index runs past the end
                 # of the fire's time series.
-                sub = dset[in_fire_index:end_index, self._raw_channels_needed]
+                sub = dset[start_index:end_index, self._raw_channels_needed]
                 imgs = np.zeros(
                     (sub.shape[0], dset.shape[1]) + sub.shape[2:], dtype=sub.dtype)
                 imgs[:, self._raw_channels_needed] = sub
@@ -396,11 +502,14 @@ class FireSpreadDataset(Dataset):
                     end_index-1)]
                 doys = self.img_dates_to_doys(doys)
                 doys = torch.Tensor(doys)
+            if n_pad:
+                imgs = np.concatenate(
+                    [np.zeros((n_pad,) + imgs.shape[1:], dtype=imgs.dtype), imgs], axis=0)
             x, y = np.split(imgs, [-1], axis=0)
             # Last image's active fire mask is used as label, rest is input data
             y = y[0, -1, ...]
         else:
-            imgs_to_load = self.imgs_per_fire[found_fire_year][found_fire_name][in_fire_index:end_index]
+            imgs_to_load = self.imgs_per_fire[found_fire_year][found_fire_name][start_index:end_index]
             imgs = []
             for img_path in imgs_to_load:
                 with rasterio.open(img_path, 'r') as ds:
@@ -426,6 +535,18 @@ class FireSpreadDataset(Dataset):
 
         x, y = self.preprocess_and_augment(x, y)
 
+        # Compute centroid kinematics from full (T, 40, H, W) tensor before any filtering.
+        # Channel 39 is binary active fire; augmentation has already been applied at this point.
+        if self._use_any_centroid:
+            centroid_channels = self._compute_centroid_channels(x)
+
+        # Drop the peek-back frame(s) now that the kinematics are computed. They exist only to
+        # give the oldest model-visible frame a previous day; the model must not see them, and
+        # everything downstream (get_n_features, flatten_and_remove_duplicate_features_) assumes
+        # x holds exactly n_leading_observations frames.
+        if self._n_peek_frames:
+            x = x[self._n_peek_frames:]
+
         # Remove duplicate static features, which can greatly reduce the number of features, since we use 
         # one-hot encoded landcover types. The result would have different amounts of feature channels per 
         # time step, therefore, we flatten the temporal dimension.
@@ -438,6 +559,30 @@ class FireSpreadDataset(Dataset):
             # Effective ids, not the raw config ones: identical to the config unless the
             # land-cover one-hot was skipped, in which case they are remapped to 24-space.
             x = x[:, self._features_to_keep_effective, ...]
+
+        # Append the enabled centroid channels after all other processing. The count is no
+        # longer fixed at 6 -- it is len(self._centroid_channel_names), 0 to 6 depending on which
+        # of the four flags are on.
+        #
+        # The concat axis depends on x's RANK, and the two cases are not interchangeable (P3).
+        # flatten_and_remove_duplicate_features_ only runs when n_lead > 1, so:
+        #   n_lead > 1  -> x is 3-D (C_total, H, W); the channel axis is 0.
+        #   n_lead == 1 -> x is still 4-D (T=1, C, H, W); the channel axis is 1, and dim=0 is
+        #                  TIME. Concatenating on dim=0 there stacks the centroid maps as extra
+        #                  timesteps: shape-valid, silently meaningless, and it was doing exactly
+        #                  that for every A arm before this fix.
+        # Keeping the n_lead=1 case 4-D (rather than squeezing x to 3-D) is deliberate: A0 and A1
+        # then return the same rank and differ only in channel count, so nothing downstream has
+        # to branch on which arm is running. BaseModel.forward flattens (B,T,C,H,W) ->
+        # (B,T*C,H,W) at src/models/BaseModel.py:78, which absorbs the T=1 axis either way.
+        if self._use_any_centroid:
+            if x.dim() == 4:
+                assert x.shape[0] == 1, (
+                    f"4-D x with T={x.shape[0]} > 1 cannot take centroid channels; "
+                    "remove_duplicate_features=True is required and should have flattened it.")
+                x = torch.cat([x, centroid_channels.unsqueeze(0)], dim=1)
+            else:
+                x = torch.cat([x, centroid_channels], dim=0)
 
         if self.return_doy:
             return x, y, doys
@@ -930,3 +1075,131 @@ class FireSpreadDataset(Dataset):
                 # Turn active fire detection time from hhmm to hh.
                 x[:, -1, ...] = np.floor_divide(x[:, -1, ...], 100)
                 yield year, fire_name, img_dates, lnglat, x
+
+
+    def _compute_centroid_channels(self, x):
+        """Compute the enabled fire-centroid channels as constant (broadcast) spatial maps.
+
+        Operates on the preprocessed tensor `(n_peek + T, C, H, W)` before feature filtering,
+        where the leading `self._n_peek_frames` rows are the peek-back day(s) that the model
+        will never see. The binary active-fire mask is always the LAST channel --
+        preprocess_and_augment appends it after standardization -- so it is indexed with -1
+        rather than a fixed 39: C is 24 rather than 40 whenever the land-cover one-hot is
+        skipped (self._skip_one_hot).
+
+        Every frame in x has been through the SAME crop, rotation and flip, because
+        preprocess_and_augment runs on the whole stack. That is what makes an inter-frame
+        centroid displacement meaningful: a separately-loaded peek frame would sit in a
+        different spatial frame and the "velocity" would be measuring the crop offset -- which,
+        since the crop search is fire-biased, would be a systematic bias pointing at the fire.
+
+        Returns:
+            Tensor of shape `(n, H, W)` with `n == len(self._centroid_channel_names)
+            == T * (enabled families)`, family-major and oldest-first within a family, matching
+            CENTROID_CHANNEL_SPEC. Position is patch-relative in [-1, 1]; velocity is the
+            centroid's displacement from the previous day, normalized by H/4 (resp. W/4).
+            Position falls back to the patch centre on a fire-free frame (which normalizes to
+            exactly 0.0 -- deliberately indistinguishable from a genuinely centred fire), and
+            velocity is gated to zero unless both the frame and its predecessor hold fire. Both
+            fallbacks apply whether or not the matching validity channel is emitted: "validity
+            off" means gate *silently* (EXPERIMENTS.md, "Decided conventions", 2026-08-05).
+        """
+        n_peek = self._n_peek_frames
+        T_total, C, H, W = x.shape
+        T = T_total - n_peek          # frames the model will actually see
+
+        fire_masks = x[:, -1, :, :]   # (T_total, H, W), binary active fire
+
+        totals = fire_masks.sum(dim=(-2, -1))   # (T_total,) fire-pixel count per frame
+        totals_safe = totals.clamp(min=1.0)     # avoids 0/0 on fire-free frames
+
+        h_idx = torch.arange(H, dtype=torch.float32)
+        w_idx = torch.arange(W, dtype=torch.float32)
+        cx_all = (fire_masks * h_idx.view(H, 1)).sum(dim=(-2, -1)) / totals_safe  # (T_total,)
+        cy_all = (fire_masks * w_idx.view(1, W)).sum(dim=(-2, -1)) / totals_safe  # (T_total,)
+
+        # Validity is read off the RAW frame totals, BEFORE the patch-centre fallback below
+        # overwrites cx_all/cy_all -- otherwise the flag would describe the substituted value
+        # instead of the data. `a[n_peek:] & a[n_peek-1:-1]` is the "this frame AND its
+        # predecessor" idiom: two shifted views of one array, so the pairing is visible in the
+        # slice rather than hidden in a loop index. Note `&` on tensors, not Python `and`, and
+        # note that `&` binds TIGHTER than `>` -- every comparison needs its own parentheses.
+        frame_has_fire = totals > 0                        # (T_total,) bool
+        pos_valid = frame_has_fire[n_peek:].float()        # (T,)
+        if n_peek:
+            vel_valid = (frame_has_fire[n_peek:] & frame_has_fire[n_peek - 1:-1]).float()  # (T,)
+        else:
+            vel_valid = torch.zeros(T, dtype=torch.float32)
+
+        # Fall back to the patch centre on fire-free frames.
+        cx_all = torch.where(totals >= 1.0, cx_all, torch.full_like(cx_all, H / 2.0))
+        cy_all = torch.where(totals >= 1.0, cy_all, torch.full_like(cy_all, W / 2.0))
+
+        # Each value is a (T,) tensor -- one entry per model-visible frame. These `if`s decide
+        # what is cheap and legal to COMPUTE.
+        channels = {}
+        if self.use_centroid_position:
+            # A fire-free frame already normalizes to 0.0 (H/2 / (H/2) - 1), so no extra gating
+            # by pos_valid is needed -- and that 0.0 is intentionally confusable with a genuinely
+            # centred fire, which is what makes the validity channel a test of *disclosure*.
+            channels["centroid_x"] = cx_all[n_peek:] / (H / 2.0) - 1.0
+            channels["centroid_y"] = cy_all[n_peek:] / (W / 2.0) - 1.0
+        if self.use_centroid_velocity:
+            assert n_peek, "velocity channels require a peek-back frame"
+            # /4.0 is a heuristic: a fire centroid is unlikely to travel more than a quarter of
+            # the patch in a day, so this puts velocity on roughly the same scale as position.
+            channels["centroid_vx"] = \
+                (cx_all[n_peek:] - cx_all[n_peek - 1:-1]) / (H / 4.0) * vel_valid
+            channels["centroid_vy"] = \
+                (cy_all[n_peek:] - cy_all[n_peek - 1:-1]) / (W / 4.0) * vel_valid
+        if self.use_centroid_position_validity:
+            channels["position_valid"] = pos_valid
+        if self.use_centroid_velocity_validity:
+            channels["velocity_valid"] = vel_valid
+
+        # CENTROID_CHANNEL_SPEC decides what is EMITTED and in what order; the `if`s above only
+        # decide what is computed. Stacking in SPEC order and then flattening gives exactly the
+        # family-major, oldest-first layout centroid_channel_names() declares, and the assert is
+        # the seam that stops the two halves drifting apart silently.
+        families = [f for f, _ in FireSpreadDataset.CENTROID_CHANNEL_SPEC if f in channels]
+        stacked = torch.stack([channels[f] for f in families])          # (n_families, T)
+        assert stacked.numel() == len(self._centroid_channel_names), (
+            f"computed {stacked.numel()} channels but spec declares "
+            f"{len(self._centroid_channel_names)}: {self._centroid_channel_names}")
+
+        # reshape -> (n, 1, 1), then broadcast to (n, H, W). .expand() returns a zero-stride
+        # view, so .contiguous() before it crosses the DataLoader's collate/pinning boundary.
+        return stacked.reshape(-1, 1, 1).expand(-1, H, W).contiguous()
+
+    @staticmethod
+    def get_n_features(n_observations:int, features_to_keep:Optional[List[int]], deduplicate_static_features:bool):
+        """_summary_ Computes the number of features that the dataset will have after preprocessing, 
+        considering the number of input observations, which features to keep or discard, and whether to deduplicate static features.
+
+        Args:
+            n_observations (int): _description_
+            features_to_keep (Optional[List[int]]): _description_
+            deduplicate_static_features (bool): _description_
+
+        Returns:
+            _type_: _description_ If deduplicate_static_features is True, returns the total number of features, flattened across all time steps. 
+            Otherwise, returns the number of features per time step.
+        """
+        static_features_to_keep, dynamic_features_to_keep = FireSpreadDataset.get_static_and_dynamic_features_to_keep(features_to_keep)
+
+        n_static_features = len(static_features_to_keep)
+        n_dynamic_features = len(dynamic_features_to_keep)
+        n_all_features = n_static_features + n_dynamic_features
+
+        # If we deduplicate static features, we remove them from all time steps but the last one.
+        # The last day then gets dynamic and static features. All other days only get dynamic features. 
+        
+        #BUG IN LOGIC! When not deduplicating static features, n_features does not account for all n_observations days of n_all_features
+        #n_features = (int(deduplicate_static_features)*n_dynamic_features)*(n_observations-1) + n_all_features
+        #REFLACEMENT WITH CLEAR LOGIC:
+        if deduplicate_static_features:
+            n_features= n_all_features + (n_observations-1)*(n_dynamic_features)
+        else:
+            n_features = n_all_features * n_observations
+
+        return n_features

@@ -1,0 +1,16 @@
+# EXP-03 arm A2: n_lead=1, centroid POSITION plus its validity disclosure.
+# Pairs against A1 (identical but no validity channel) for comparison 2 in
+# administrative/EXPERIMENTS.md: "does DISCLOSING a fabricated (patch-centre) centroid help?"
+# Both arms gate identically; only the disclosure differs. Read A2 - A0 with care: that contrast
+# bundles position and disclosure together, which is why A1 is the arm it should be paired with.
+#
+# Velocity flags off -> _n_peek_frames = 0, so load_imgs does not peek back and this arm exercises
+# exactly the pre-peek-back loading path. At n_lead=1 the per-timestep layout is identical to the
+# last-day-only layout, so this arm is unaffected by EXPERIMENTS.md P2's two open decisions --
+# in particular, velocity-validity redundancy (open decision 1) cannot touch it.
+# Channel count: 7 base + 3 = 10.
+n_leading_observations: 1
+use_centroid_position: true
+use_centroid_velocity: false
+use_centroid_position_validity: true
+use_centroid_velocity_validity: false

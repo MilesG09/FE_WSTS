@@ -1,0 +1,7 @@
+# EXP-03 arm C0: n_lead=5, centroid-free control. Reproduces WSTS+ paper Table 2, Res18-Unet,
+# Veg, T=5 -> target AP 0.472 +/- 0.083 (administrative/EXPERIMENTS.md, "Validation-gate targets").
+n_leading_observations: 5
+use_centroid_position: false
+use_centroid_velocity: false
+use_centroid_position_validity: false
+use_centroid_velocity_validity: false
