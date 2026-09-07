@@ -1,0 +1,17 @@
+# EXP-03 arm A4: n_lead=1, centroid VELOCITY only, no position, no validity disclosure.
+# The velocity-side mirror of A1. Its role is comparison 8 in administrative/EXPERIMENTS.md:
+# (A2-A1) vs (A5-A4) -- "which fabricated fallback is more harmful to leave undisclosed, the
+# patch-centre position or the zero velocity?" A4 is the undisclosed leg of that second pair.
+# Also serves as the partial control noted at EXPERIMENTS.md line 130: A4 (velocity, no position)
+# vs A1 (position, no velocity) isolate the two families against each other.
+#
+# "validity: off" means gate SILENTLY (EXPERIMENTS.md, "Decided conventions", 2026-08-05): the
+# velocity is still multiplied by vel_valid, the model just isn't told that it was zeroed.
+#
+# Velocity ON -> _n_peek_frames = 1 (see the A3 header for why the sample count is unchanged).
+# Channel count: 7 base + 2 (centroid_vx, centroid_vy) = 9.
+n_leading_observations: 1
+use_centroid_position: false
+use_centroid_velocity: true
+use_centroid_position_validity: false
+use_centroid_velocity_validity: false

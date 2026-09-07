@@ -1,10 +1,16 @@
 # Storage
 *.pyc
+__pycache__/
 logs/
 lightning_logs/
 artifacts/
 hdf5_data
 quarantine_dataset_files/
+test_pr_curve_data.npz
+
+# Machine-local settings: python path, dataset path, host name, worker counts.
+# One per machine, never committed -- see env.local.sh.example.
+env.local.sh
+
 # personal research journal (not tracked)
 administrative/
-scripts/

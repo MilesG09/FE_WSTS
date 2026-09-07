@@ -1,0 +1,21 @@
+# EXP-03 arm A3: n_lead=1, centroid POSITION plus VELOCITY, no validity disclosure.
+# Pairs against A1 (identical but position-only) for comparison 3 in administrative/EXPERIMENTS.md:
+# "does explicit VELOCITY help a model that cannot perceive motion at all?" -- the model still sees
+# a single frame, so any gain is information it could not have derived itself.
+#
+# "validity: off" means gate SILENTLY (EXPERIMENTS.md, "Decided conventions", 2026-08-05): velocity
+# is still multiplied by vel_valid internally and position still falls back to the patch centre,
+# the model just isn't told when either happened.
+#
+# Velocity ON -> _n_peek_frames = 1, so load_imgs reaches one frame further back than the model is
+# shown. Per EXPERIMENTS.md P2 (DONE 2026-08-25) velocity is defined PER MODEL-VISIBLE FRAME, so
+# this arm emits T=1 velocity channels rather than the zero a T-1 definition would give; the peek
+# row is zero-padded at a fire's first observed day, so the sample count is UNCHANGED vs A1/A2
+# (the "smaller training sets" bullet in Decided conventions is void -- verified 4091 samples with
+# and without peek-back).
+# Channel count: 7 base + 4 (centroid_x, centroid_y, centroid_vx, centroid_vy) = 11.
+n_leading_observations: 1
+use_centroid_position: true
+use_centroid_velocity: true
+use_centroid_position_validity: false
+use_centroid_velocity_validity: false

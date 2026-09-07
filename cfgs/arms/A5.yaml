@@ -1,0 +1,21 @@
+# EXP-03 arm A5: n_lead=1, centroid VELOCITY plus its validity disclosure, no position.
+# Pairs against A4 (identical but no validity channel) to give the second half of comparison 8 in
+# administrative/EXPERIMENTS.md: (A2-A1) vs (A5-A4) tests which fabricated fallback is more harmful
+# left undisclosed -- the patch-centre position (A-pair) or the zero velocity (this pair).
+#
+# Only the VELOCITY validity flag is on: position is off in this arm, so there is nothing for
+# use_centroid_position_validity to disclose. The "validity flags are always emitted as a pair"
+# convention (EXPERIMENTS.md, Decided conventions) binds only when both families are present.
+#
+# When reading comparison 8, log and report the FIRING RATES of pos_valid and vel_valid alongside
+# it (EXPERIMENTS.md, "Interpreting comparison 8 honestly"): vel_valid needs fire in BOTH of the
+# last two frames, so it fires false strictly more often than pos_valid, and the two deltas are
+# not on comparable footing without those rates.
+#
+# Velocity ON -> _n_peek_frames = 1 (see the A3 header for why the sample count is unchanged).
+# Channel count: 7 base + 3 (centroid_vx, centroid_vy, velocity_valid) = 10.
+n_leading_observations: 1
+use_centroid_position: false
+use_centroid_velocity: true
+use_centroid_position_validity: false
+use_centroid_velocity_validity: true
