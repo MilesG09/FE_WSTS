@@ -301,7 +301,9 @@ class FireSpreadDataset(Dataset):
     # vanishes while the scatter cost stays.
     #
     # Measured, not guessed (scripts/benchmark_hyperslab_density.py, 2026-09-04, evenly
-    # spread channels, cold cache, 3 files x 3 trials). Read time vs the plain full read:
+    # spread channels, cold cache, 3 files x 3 trials). That script was pruned from
+    # scripts/ on 2026-09-07; recover it from git at commit a9cdfc4 to re-measure.
+    # Read time vs the plain full read:
     #
     #   fraction of channels :  0.09  0.17  0.26  0.35  0.43  0.52  0.70
     #   T=1 (2 frames read)  : 3.28x 1.46x 1.15x 0.94x 0.76x 0.74x 0.65x

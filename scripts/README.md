@@ -7,13 +7,24 @@ Most of these are one-off / rerunnable tools written to answer a specific questi
 a maintained CLI suite — read the header comment in the script itself for the full
 reasoning behind any nonobvious choice.
 
+The shell runners hardcode `PY=/home/miles/miniconda3/envs/WSTS_original/bin/python`
+rather than relying on an activated env. An absolute path to an env's `bin/python`
+selects that env's site-packages on its own, so whatever `conda activate` you happen to
+be in does not affect a scripted run — only bare `python` typed by hand.
+
+This directory was pruned on 2026-09-07 to the launch path actually in use plus the
+correctness gates. Roughly forty superseded one-off scripts (dataloader/LR tuning
+sweeps, MLflow-era result readers, the `run_12fold_cv.sh` generation of runners, and
+the read-path benchmarks) were removed; they remain in git history at commit `a9cdfc4`
+and earlier if a measurement needs to be repeated or a rationale re-read.
+
 ## Dataset profiles (`wsts_profiles.py`)
 
-Every efficiency verification and benchmark script takes `--profile <name>` instead of
-hardcoding a config, and `--data-dir` (default `~/research/old_repo_FE_WSTS/hdf5_data`,
-since the checked-in cfgs point at the original authors' cluster paths). A profile is a
-committed data config plus overrides, chosen so that between them they exercise every
-branch of the optimised code:
+Every verification script takes `--profile <name>` instead of hardcoding a config, and
+`--data-dir` (default `~/research/old_repo_FE_WSTS/hdf5_data`, since the checked-in
+cfgs point at the original authors' cluster paths). A profile is a committed data config
+plus overrides, chosen so that between them they exercise every branch of the optimised
+code:
 
 | profile | config | what it exercises |
 |---|---|---|
@@ -25,101 +36,53 @@ branch of the optimised code:
 
 Add a profile there rather than editing each script.
 
-## Dataloader tuning (num_workers / prefetch_factor / lr)
+## Launching arm runs
 
-- **`training_parameter_search.sh`** — Grid-searches `(num_workers, prefetch_factor)`
-  throughput for arms A and C on fold 0 (500 steps each), shuffled run order plus an
-  untimed warm-up per arm to cancel OS page-cache bias, with a memory-settle wait
-  between runs. Writes `training_parameter_search_results.csv`. Machine-local tuning
-  only — no scientific parameters are touched.
-- **`probe_higher_workers_A0.sh`** — Narrow follow-up to the above: checks whether
-  `num_workers=10/12` beat the `nw=8` winner for A0 (prefetch_factor fixed at 2).
-  Appends its results into the same `training_parameter_search_results.csv`.
-- **`lr_sweep.sh`** — Learning-rate sweep for A0 fold 2 (50 epochs, 4 LR values),
-  using whatever `(num_workers, prefetch_factor)` the throughput search found best
-  (pass as `--num_workers`/`--prefetch_factor`). Calls `lr_sweep_analyze.py` at the
-  end to report the winner.
-- **`lr_sweep_analyze.py`** — Given a run-name prefix, pulls each MLflow run's *peak*
-  `val_avg_precision` (not the last-logged value, since 50 epochs of no-early-stop
-  training can overfit past its best point) and prints LRs ranked by that peak.
-- **`run_overnight_sweep_and_lr.sh`** — Orchestrates the two scripts above as one
-  detached overnight job: runs `training_parameter_search.sh`, extracts arm A's
-  fastest `(nw, pf)` from the CSV, then feeds it into `lr_sweep.sh`. Writes a status
-  file (`logs/overnight_sweep_status_*.txt`) so progress/failure survives even if the
-  launching session disconnects.
-- **`watch_sweep_logs.sh <logfile> [logfile ...]`** — Tails one or more sweep logs and
-  filters to high-signal lines only (stage banners, errors, OOM/kill signatures,
-  final results) — built so a log can be babysat without drowning in Lightning's
-  per-step progress-bar spam.
+This is the current launch path, and the only one — `launch_arms_sequential.sh` →
+`run_arms_sequential.sh` → `run_fold_subset_cv.sh` → `src/train.py`. The env pin lives
+in the innermost script, so every arm launched this way trains under `WSTS_original`.
 
-## 12-fold cross-validation runs
+- **`launch_arms_sequential.sh <arms> <folds> <nw> <pf> <lr> <suffix> [seed]`** —
+  Detached launcher for the runner below: `setsid`, not just `nohup`, because when
+  launched through `wsl.exe -- bash -lc ...` the WSL session is torn down as soon as
+  `wsl.exe` returns and a plain background job dies with it. Writes a timestamped log
+  under `logs/` and echoes the runner pid. Example:
+  `bash scripts/launch_arms_sequential.sh "A1 A2" "1 5 6 11" 8 3 1e-3 bs64`
+- **`run_arms_sequential.sh <arms> <folds> <nw> <pf> <lr> <suffix> [seed]`** — Runs
+  several arms back-to-back on the same fold subset by delegating each to
+  `run_fold_subset_cv.sh`. Fails fast on a typo'd arm name (checks `cfgs/arms/<ARM>.yaml`
+  exists) rather than 4.5 hours into the night, and a failing arm does **not** stop the
+  ones after it — an overnight job that dies on arm 1 at 2 a.m. should still deliver
+  arm 2 by morning.
+- **`run_fold_subset_cv.sh <arm> <run_prefix> <extra_data_yaml|none> <folds> <nw> <pf> <lr> <suffix>`**
+  — Trains and tests one arm across an arbitrary fold subset, with an optional extra
+  `--data` override file (used by the val-adjustment comparison arms A0v/B0v/C0v; see
+  `administrative/EXPERIMENTS.md`). Every scientific parameter comes from the committed
+  configs (`cfgs/data_base.yaml` + `cfgs/arms/<ARM>.yaml` + optional override) — only run
+  identity, the fold list, and machine-local dataloader tuning are CLI args.
 
-- **`run_12fold_cv.sh <arm letter> <num_workers> <prefetch_factor> <lr> <run_suffix>`**
-  — Runs all 12 LOYO folds for one arm back-to-back (train+test each), using
-  whatever dataloader/LR settings were already confirmed best; per-fold failures are
-  logged and skipped rather than aborting the whole run. Every scientific parameter
-  comes from the committed configs — only run identity and machine-local tuning are
-  CLI args.
-- **`launch_C0_sweep.sh`** — Launches `run_12fold_cv.sh` for arm C, fully detached
-  (`setsid nohup`) with a timestamped log under `logs/`. Exists specifically because
-  launching a long-lived background job from Windows via `wsl.exe -- bash -lc '...'`
-  otherwise dies when `wsl.exe` returns; `setsid` keeps it alive.
-- **`shutdown_after_sweep.ps1`** (PowerShell, run from Windows, not WSL) — Polls
-  until no `run_12fold_cv.sh`/`train.py` process is left running, waits a grace
-  period for MLflow to flush, logs a final run inventory, then does a clean
-  `wsl --shutdown` followed by a Windows shutdown. Create `scripts/ABORT_SHUTDOWN`
-  (any contents) to cancel it before it fires; it also self-aborts past `-MaxHours`
-  (default 12h) as a safety net against a stuck sweep triggering a surprise shutdown.
+## Reading results
 
-## Reading MLflow results
-
-- **`inspect_mlflow_runs.py`** — Reads the MLflow *file store* under `mlruns/`
-  directly (bypassing the UI/API), because a run that dies without MLflow's exit
-  hook firing leaves `status: RUNNING` forever while the UI still shows a stale green
-  check. Flags runs stuck in `RUNNING` and runs missing `test_*` metrics.
-  `--filter <substr>` narrows by run name, `--show-metrics` prints every metric's
-  last value, `--compare a,b,c` tabulates param values + epoch count + wall time
-  across matching runs.
 - **`find_runs.py`** — Pulls a wandb summary metric (`--metric`, default `test_AP`)
   for every run whose name matches `--run_name_like` (SQL-LIKE style, `%` the only
   wildcard) and prints one row per run plus the mean across them. Drops
   `superseded`/`invalidated`-tagged and non-`finished` runs by default, and
   collapses same-named reruns to the most recently created one
   (`--include_dropped` / `--include_unfinished` / `--keep_duplicates` to keep
-  them). Auth via
-  `~/.netrc` / `WANDB_API_KEY`; entity/project default to
+  them). Auth via `~/.netrc` / `WANDB_API_KEY`; entity/project default to
   `milesgoodman09-viewpoint-school/FE_WSTS`.
-- **`collect_12fold_results.py --run_name_like '<pattern>'`** — General version of
-  the above: pulls a given `--metric` (default `test_avg_precision`) for every run
-  matching a SQL `LIKE` pattern, sorts by fold number, and prints mean/population-std
-  across folds (population std matches the paper's per-fold convention).
+- **`Testbook.ipynb`** — Scratch notebook for ad-hoc inspection of runs and results.
 
-## HDF5 read-path optimization & verification
+## Feature correctness
 
-- **`channel_check.py`** — Audits every HDF5 file's channel-dimension shape,
-  per year, to check whether `features_to_keep`'s assumption of a 40-channel layout
-  actually holds across the whole dataset (a sampled 2020 file was found with only
-  23 channels).
-- **`benchmark_hdf5_read_strategies.py`** — Measures actual disk bytes read per
-  `__getitem__` (via `/proc/self/io`, with page-cache eviction before each read) for
-  three strategies: (A) current — read all channels then filter in Python, (B)
-  hyperslab — let HDF5 select only the needed raw channels, (C) same as B but on a
-  rechunked+lzf-compressed copy. Reports amplification vs. what the model actually
-  consumes. `--samples`, `--files`, `--skip-chunked`.
-- **`benchmark_hyperslab_density.py --profile <p>`** — Measures where the hyperslab
-  stops paying for itself, by timing reads (and counting block-layer bytes) for channel
-  subsets of increasing density on the real files. This is the evidence behind
-  `FireSpreadDataset.HDF5_READ_OPT_MAX_FRACTION`: the crossover moves with the number of
-  frames read, and past it the partial read is *slower* than the plain full read.
-- **`verify_channel_dependency.py --profile <p>`** — Empirically determines which raw
-  HDF5 channels the pipeline's output actually depends on, by zeroing one raw channel at
-  a time and checking whether `(x, y)` changes — a code-agnostic check that doesn't trust
-  a by-hand index mapping. Then asserts `raw_channels_for_features()` reads a superset of
-  what it measured; reading *less* is a hard fail.
-- **`verify_read_optimization.py --profile <p>`** — Focused correctness gate for the
-  hyperslab read in `FireSpreadDataset.load_imgs`: builds the same dataset with the
-  optimisation forced off (`WSTS_DISABLE_HDF5_READ_OPT=1`) and on, and asserts every
-  compared sample is bit-identical.
+- **`verify_centroid_channels.py`** — Verifies `_compute_centroid_channels` and the
+  peek-back loading path against known answers. The centroid feature has four independent
+  flags and emits one channel per family per model-visible timestep, so there are
+  16 × `n_lead` valid input layouts, and the count `src/train.py` derives from config
+  alone has to match the tensor the dataloader actually produces for every one of them.
+  Most sections use a synthetic `(T, C, H, W)` tensor with fire at chosen pixels, making
+  every expected value computable by hand — they run in under a second with no data
+  directory (`--skip-data`), so there is no excuse not to run them.
 
 ## Efficiency correctness gates (run these before any sweep)
 
@@ -138,6 +101,15 @@ Each speed-up in `FireSpreadDataset` keeps its original code path behind a
   if a flag were ever misspelled or stopped being read. Builds two datasets normally and
   forces one back to the legacy path by resetting the four instance attributes the
   optimisations hang off.
+- **`verify_read_optimization.py --profile <p>`** — Focused correctness gate for the
+  hyperslab read in `FireSpreadDataset.load_imgs`: builds the same dataset with the
+  optimisation forced off (`WSTS_DISABLE_HDF5_READ_OPT=1`) and on, and asserts every
+  compared sample is bit-identical.
+- **`verify_channel_dependency.py --profile <p>`** — Empirically determines which raw
+  HDF5 channels the pipeline's output actually depends on, by zeroing one raw channel at
+  a time and checking whether `(x, y)` changes — a code-agnostic check that doesn't trust
+  a by-hand index mapping. Then asserts `raw_channels_for_features()` reads a superset of
+  what it measured; reading *less* is a hard fail.
 - **`verify_dataloader_settings.py --profile <p> --workers 8`** — Covers the
   `FireSpreadDataModule` knobs, which act on the loader rather than on one sample, so
   they need whole epochs rather than sample comparison. Confirms `prefetch_factor` and
@@ -149,24 +121,11 @@ Each speed-up in `FireSpreadDataset` keeps its original code path behind a
   `FireSpreadDataModule`'s ignition filters iterate the whole dataset in the parent
   first. This reproduces that exact ordering and checks the data still matches, since
   inherited HDF5 descriptors corrupt silently rather than raising.
-
-## Profiling
-
-- **`profile_training_bottleneck.py`** — Samples a *live* `train.py` process for
-  N seconds (GPU util via `nvidia-smi`, worker CPU% via `/proc/<pid>/stat`, disk
-  MB/s via `/proc/diskstats`, swap/major-faults via `/proc/vmstat`) and prints a
-  verdict: GPU-bound, I/O-bound, memory-pressure-bound, CPU-bound, or none-saturated
-  (a latency/serialization regime, not a throughput wall). `--secs` (default 20).
-- **`profile_getitem.py --profile <p>`** — cProfile's `FireSpreadDataset.__getitem__`
-  directly (not the full training loop) to rank which callees consume per-sample CPU
-  time, after a short warm-up so file-handle-open cost doesn't pollute the profile.
-  `--samples`, `--top`.
-- **`benchmark_getitem_ab.py --profile <p> --flags <flags>`** — Alternating in-process
-  A/B of per-sample cost for effects near the noise floor: both variants time in ONE
-  process, alternating after a warmup so neither wins on cache state. Reports medians
-  with min/max, and refuses to let an overlapping spread be quoted as a ratio.
-- **`benchmark_dataloader_throughput.py --profile <p> --workers 4,8,12`** — Real
-  `DataLoader` batches/s across `num_workers` (and, with `--prefetch`, a joint
-  `num_workers x prefetch_factor` grid), cold and warm. A **screen only**: it measures
-  loader capacity with no consumer — no GPU work competing for CPU, no backpressure — so
-  confirm finalists with real training runs before believing a wall-clock gain.
+- **`verify_training_equivalence.sh [max_steps] [num_workers]`** — End-to-end proof that
+  the speed-ups do not change *training*. The gates above compare `(x, y)` at the
+  dataloader's output; this compares the far end — two real training runs, identical
+  arguments and seed, one with every `WSTS_DISABLE_*` flag set and one with none, then
+  diffs the per-step losses and a hash of the final model weights. `num_workers=0` by
+  default and deliberately: with workers, augmentation RNG lives in forked processes
+  whose seeding depends on worker count and iterator lifetime, so two runs would
+  legitimately differ for reasons unrelated to the optimisations.
