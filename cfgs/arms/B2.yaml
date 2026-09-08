@@ -1,0 +1,5 @@
+n_leading_observations: 2
+use_centroid_position: true
+use_centroid_velocity: false
+use_centroid_position_validity: true
+use_centroid_velocity_validity: false

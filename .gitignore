@@ -14,3 +14,4 @@ env.local.sh
 
 # personal research journal (not tracked)
 administrative/
+.vscode/
