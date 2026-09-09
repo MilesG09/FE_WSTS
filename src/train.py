@@ -127,10 +127,16 @@ class MyLightningCLI(LightningCLI):
             n_timesteps=d.n_leading_observations)
 
         arm_id = os.environ.get("ARM_ID", "unspecified")
+        # Which physical box ran this. Like arm_id, not recoverable from config, so it comes
+        # from the environment -- MACHINE_NAME is set per machine in the untracked env.local.sh
+        # and sourced by the launch scripts. Run names carry no host, so without this a sweep
+        # split across boxes is unattributable. Runs predating 2026-09-08 were back-tagged.
+        machine = os.environ.get("MACHINE_NAME", "unspecified")
         tags = [f"arm_{arm_id}",
                 f"fold_{d.data_fold_id}",
                 f"seed_{self.config.seed_everything}",
-                f"nlead_{d.n_leading_observations}"]
+                f"nlead_{d.n_leading_observations}",
+                f"machine: {machine}"]
         for flag, short in (("use_centroid_position", "pos"),
                             ("use_centroid_velocity", "vel"),
                             ("use_centroid_position_validity", "posvalid"),
