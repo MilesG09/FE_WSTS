@@ -20,6 +20,7 @@ A speed-up that is only checked on the happy path is not checked.
 """
 
 import os
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -27,9 +28,33 @@ import yaml
 
 REPO = Path(__file__).resolve().parents[1]
 
-# Local dataset, since every checked-in cfg points at a stale cluster path.
-DEFAULT_DATA_DIR = os.environ.get(
-    "WSTS_DATA_DIR", "/home/miles/research/old_repo_FE_WSTS/hdf5_data")
+
+def _data_dir_from_env_local() -> Optional[str]:
+    """DATA_DIR out of the untracked env.local.sh, without executing it.
+
+    The shell scripts source that file; these python gates cannot, so they read the one
+    assignment they need. Deliberately a plain text scan and not a shell call: importing a
+    helper must never run arbitrary code from a file on the machine.
+    """
+    path = REPO / "env.local.sh"
+    if not path.is_file():
+        return None
+    found = None
+    for line in path.read_text().splitlines():
+        m = re.match(r"\s*(?:export\s+)?DATA_DIR=(.*)$", line)
+        if m:  # last assignment wins, matching how the shell would evaluate the file
+            value = m.group(1).strip().strip('"').strip("'")
+            if value:
+                found = value
+    return found
+
+
+# Dataset root, since every checked-in cfg points at a stale cluster path. Machine-local, so
+# it is never hardcoded here: WSTS_DATA_DIR (one-off override) beats env.local.sh (the
+# machine's standing setting). None when neither is set -- --data-dir then becomes required,
+# which fails loudly instead of globbing an empty directory on someone else's box.
+DEFAULT_DATA_DIR = os.environ.get("WSTS_DATA_DIR") or os.environ.get(
+    "DATA_DIR") or _data_dir_from_env_local()
 
 # name -> (config file, overrides applied on top of it)
 PROFILES = {
@@ -64,6 +89,7 @@ def add_dataset_args(parser) -> None:
     parser.add_argument("--profile", default="veg_t1", choices=sorted(PROFILES),
                         help="named dataset configuration to test (see PROFILES)")
     parser.add_argument("--data-dir", default=DEFAULT_DATA_DIR,
+                        required=DEFAULT_DATA_DIR is None,
                         help="dataset root; checked-in cfgs point at stale cluster paths")
     parser.add_argument("--years", default="2020",
                         help="comma-separated fire years to include")

@@ -20,7 +20,15 @@ cd "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
 STEPS=${1:-30}
 NW=${2:-0}
 PY=/home/miles/miniconda3/envs/WSTS_original/bin/python
-DATA_DIR=${WSTS_DATA_DIR:-/home/miles/research/old_repo_FE_WSTS/hdf5_data}
+DATA_DIR=""
+# Machine-local overrides -- same contract as scripts/run_fold_subset_cv.sh: untracked
+# env.local.sh, sourced AFTER the defaults so the local file wins. WSTS_DATA_DIR still beats
+# it, so a one-off run against a different dataset copy needs no edit to the file.
+[ -f env.local.sh ] && . ./env.local.sh
+DATA_DIR=${WSTS_DATA_DIR:-$DATA_DIR}
+[ -x "$PY" ] || { echo "ERROR: PY=$PY is not executable -- set it in env.local.sh" >&2; exit 1; }
+[ -n "$DATA_DIR" ] || { echo "ERROR: no dataset path -- set DATA_DIR in env.local.sh or export WSTS_DATA_DIR" >&2; exit 1; }
+[ -d "$DATA_DIR" ] || { echo "ERROR: DATA_DIR=$DATA_DIR does not exist" >&2; exit 1; }
 OUTDIR=$(mktemp -d)
 
 export PYTHONPATH="$PWD:$PWD/src"
