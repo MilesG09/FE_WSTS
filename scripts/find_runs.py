@@ -11,12 +11,20 @@ dropped by default. As a backstop for reruns nobody tagged, when two surviving
 runs still share a name only the most recently created one is kept and the older
 one is listed as skipped.
 
+Canonical run names end in `_fold<N>`. A run named with an extra label after that
+-- `A0_seed0_fold0_test`, produced by the run_name_tag arg of run_fold_subset_cv.sh
+for a deliberate side run such as an on-another-machine consistency check -- is
+NOT a canonical fold result and is dropped by default, because the greedy `%` in
+`A0_seed0_fold%` would otherwise pull it into the 12-fold mean. Pass
+--keep_suffixed to include them (narrow with e.g. --run_name_like 'A0_seed0_fold%_test').
+
 Auth comes from ~/.netrc / WANDB_API_KEY the same way training does; this never
 calls `wandb login` (see the wandb-new-key-old-client note).
 
 Examples:
     python scripts/find_runs.py --run_name_like 'A0_seed0_fold%'
     python scripts/find_runs.py --run_name_like 'C0_%' --metric test_f1
+    python scripts/find_runs.py --run_name_like 'A0_seed0_fold%_test' --keep_suffixed
 """
 import argparse
 import re
@@ -33,6 +41,9 @@ import wandb
 DEFAULT_ENTITY = "milesgoodman09-viewpoint-school"
 DEFAULT_PROJECT = "FE_WSTS"
 DROP_TAGS = ("superseded", "invalidated")
+# Canonical fold-result names end exactly here; anything trailing (e.g. '_test') marks a
+# deliberate side run, not one of the N folds being averaged.
+CANONICAL_NAME_RE = re.compile(r"_fold\d+$")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--run_name_like", required=True,
@@ -50,6 +61,10 @@ parser.add_argument("--include_unfinished", action="store_true",
                     help="by default, only runs in wandb state 'finished' are counted")
 parser.add_argument("--keep_duplicates", action="store_true",
                     help="do not collapse same-named runs to the newest one")
+parser.add_argument("--keep_suffixed", action="store_true",
+                    help="keep runs whose name has an extra label after the fold number "
+                         "(e.g. 'A0_seed0_fold0_test'); dropped by default so a "
+                         "'..._fold%%' aggregation stays a clean fold mean")
 args = parser.parse_args()
 
 
@@ -84,6 +99,9 @@ for r in runs:
     dropped_tag = next((t for t in DROP_TAGS if t in r.tags), None)
     if dropped_tag and not args.include_dropped:
         skipped.append((r.name, dropped_tag))
+        continue
+    if not args.keep_suffixed and not CANONICAL_NAME_RE.search(r.name):
+        skipped.append((r.name, "name-suffixed past _fold<N> (use --keep_suffixed)"))
         continue
     if r.state != "finished" and not args.include_unfinished:
         skipped.append((r.name, f"state={r.state}"))

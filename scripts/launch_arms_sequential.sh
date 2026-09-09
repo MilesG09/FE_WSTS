@@ -3,9 +3,11 @@
 # through `wsl.exe -- bash -lc ...` the WSL session is torn down as soon as wsl.exe returns and a
 # plain background job dies with it (original finding 2026-08-19, see launch_12fold_cv.sh).
 #
-# Usage: launch_arms_sequential.sh <arm_list> <fold_list> <num_workers> <prefetch_factor> <lr> <run_suffix> [seed]
+# Usage: launch_arms_sequential.sh <arm_list> <fold_list> <num_workers> <prefetch_factor> <lr> <run_suffix> [seed] [run_name_tag]
 # Example:
 #   bash scripts/launch_arms_sequential.sh "A1 A2" "1 5 6 11" 8 3 1e-3 bs64
+# Example (A0 re-run on Eric's box, tagged _test so it does not shadow the canonical A0 runs):
+#   bash scripts/launch_arms_sequential.sh "A0" "<folds>" 12 4 1e-3 ignored 0 test
 set -uo pipefail
 
 cd "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")" || exit 1
@@ -17,13 +19,14 @@ PF=${4:?prefetch_factor required}
 LR=${5:?lr required}
 SUFFIX=${6:?run_suffix required, e.g. bs64}
 SEED=${7:-0}
+RUN_TAG=${8:-}
 
 TAG=$(echo "$ARMS" | tr ' ' '_')
 mkdir -p logs
 STAMP=$(date +%Y%m%d_%H%M%S)
 LOG="logs/arms_${TAG}_${STAMP}.log"
 
-setsid nohup bash scripts/run_arms_sequential.sh "$ARMS" "$FOLDS" "$NW" "$PF" "$LR" "$SUFFIX" "$SEED" \
+setsid nohup bash scripts/run_arms_sequential.sh "$ARMS" "$FOLDS" "$NW" "$PF" "$LR" "$SUFFIX" "$SEED" "$RUN_TAG" \
     > "$LOG" 2>&1 < /dev/null &
 PID=$!
 sleep 5

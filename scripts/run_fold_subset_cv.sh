@@ -10,9 +10,12 @@
 # machine-local dataloader tuning are on the CLI, same convention as run_12fold_cv.sh.
 #
 # Usage: run_fold_subset_cv.sh <arm_yaml e.g. A0> <run_prefix e.g. A0v> <extra_data_yaml|none> \
-#                               <fold_list e.g. "1 5 6 11"> <num_workers> <prefetch_factor> <lr> <run_suffix>
+#                               <fold_list e.g. "1 5 6 11"> <num_workers> <prefetch_factor> <lr> <run_suffix> \
+#                               [seed] [run_name_tag]
 # Example (A0v, matching A0's original nw=8/pf=3):
 #   run_fold_subset_cv.sh A0 A0v cfgs/data_val_adjustment.yaml "1 5 6 11" 8 3 1e-3 bs64
+# Example (A0 re-run on another box, tagged so it does not shadow the canonical A0 runs):
+#   run_fold_subset_cv.sh A0 A0 none "1 5 6 11" 12 4 1e-3 ignored 0 test
 set -uo pipefail
 
 cd "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
@@ -57,6 +60,12 @@ SUFFIX=${8:?deprecated, ignored in naming}
 # cfgs/unet/res18_monotemporal.yaml, so a run merely NAMED seed1 would still be seed 0 --
 # the seed has to be passed to the CLI, not just into the run name.
 SEED=${9:-0}
+# Optional 10th arg: a free-form label appended to the run NAME only -- not to WANDB_RUN_GROUP
+# or WANDB_TAGS -- so a re-run of an already-validated arm on a different machine is
+# distinguishable in the run list while still landing in its arm's group for direct
+# comparison (the machine is already a wandb tag, see src/train.py). Unlike the dead SUFFIX
+# slot this carries no config value and cannot go stale against one. Empty -> names unchanged.
+RUN_TAG=${10:-}
 
 ARM_ID="$ARM_YAML"
 
@@ -78,10 +87,10 @@ if [ "$(printf '%s' "$CFG_LR" | awk '{printf "%g", $1}')" != "$(printf '%s' "$LR
 fi
 echo "=== lr asserted: config says $CFG_LR, caller expects $LR -- match ==="
 
-echo "=== [$(date)] Starting ${RUN_PREFIX} fold-subset CV: folds=[$FOLDS] num_workers=$NW prefetch_factor=$PF lr=$LR suffix=$SUFFIX extra_data=$EXTRA_DATA ==="
+echo "=== [$(date)] Starting ${RUN_PREFIX} fold-subset CV: folds=[$FOLDS] num_workers=$NW prefetch_factor=$PF lr=$LR extra_data=$EXTRA_DATA run_tag=${RUN_TAG:-<none>} ==="
 
 for fold in $FOLDS; do
-    run_name="${RUN_PREFIX}_seed${SEED}_fold${fold}"
+    run_name="${RUN_PREFIX}_seed${SEED}_fold${fold}${RUN_TAG:+_${RUN_TAG}}"
     # arm_id / fold / seed as wandb tags, written at the source. EXPERIMENTS.md records
     # centroid runs arriving with no arm/fold/config tags at all -- unattributable after
     # the fact. The run name alone is a string; tags are queryable.
@@ -90,7 +99,10 @@ for fold in $FOLDS; do
     # in the UI with mean/stddev across folds -- which is exactly the unit of
     # analysis for a LOYO cross-validation.
     export WANDB_RUN_GROUP="${ARM_ID}_seed${SEED}"
-    export WANDB_TAGS="arm_${ARM_ID},fold_${fold},seed_${SEED}"
+    # RUN_TAG (if any) also rides along as a plain wandb tag so the side runs are filterable
+    # in the UI, not just distinguishable by name. Group stays "${ARM_ID}_seed${SEED}" so a
+    # consistency-check re-run still lands beside the canonical runs for direct comparison.
+    export WANDB_TAGS="arm_${ARM_ID},fold_${fold},seed_${SEED}${RUN_TAG:+,${RUN_TAG}}"
     echo "=== [$(date)] Starting fold $fold ($run_name) ==="
 
     "$PY" "$TRAIN" \
