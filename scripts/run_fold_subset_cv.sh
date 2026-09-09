@@ -22,6 +22,23 @@ cd "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")"
 export HDF5_USE_FILE_LOCKING=FALSE
 export PYTHONPATH="$PWD:$PWD/src"
 PY=/home/miles/miniconda3/envs/WSTS_original/bin/python
+DATA_DIR=""
+# Machine-local overrides (interpreter path, dataset path) -- untracked, one per machine.
+# Sourced AFTER the defaults so the local file wins; absent on the home box, so no-op there.
+[ -f env.local.sh ] && . ./env.local.sh
+[ -x "$PY" ] || { echo "ERROR: PY=$PY is not executable -- set it in env.local.sh" >&2; exit 1; }
+[ -z "$DATA_DIR" ] || [ -d "$DATA_DIR" ] || { echo "ERROR: DATA_DIR=$DATA_DIR does not exist" >&2; exit 1; }
+DATA_DIR_ARG=(); [ -n "$DATA_DIR" ] && DATA_DIR_ARG=(--data.data_dir="$DATA_DIR")
+# wandb auth gate. Without a key wandb does not fail -- it silently switches to OFFLINE and
+# the run never reaches the server (cause of the stray offline-run-* dirs, 2026-09). A 12-fold
+# sweep that logs nowhere is worse than one that refuses to start, so refuse. Set WANDB_MODE
+# explicitly (offline/disabled) to opt out on purpose.
+if [ -z "${WANDB_MODE:-}" ] && [ -z "${WANDB_API_KEY:-}" ] && [ ! -f "$HOME/.netrc" ]; then
+    echo "ERROR: no wandb credentials (WANDB_API_KEY unset, no ~/.netrc)." >&2
+    echo "       Runs would log OFFLINE and never reach the server." >&2
+    echo "       Set WANDB_API_KEY in env.local.sh, or export WANDB_MODE=offline to accept it." >&2
+    exit 1
+fi
 TRAIN=src/train.py
 
 ARM_YAML=${1:?arm yaml name required, e.g. A0}
@@ -84,6 +101,7 @@ for fold in $FOLDS; do
         --data=cfgs/data_base.yaml \
         --data=cfgs/arms/${ARM_YAML}.yaml \
         "${EXTRA_DATA_ARG[@]}" \
+        "${DATA_DIR_ARG[@]}" \
         --data.data_fold_id="$fold" \
         --data.num_workers="$NW" \
         --data.prefetch_factor="$PF" \
